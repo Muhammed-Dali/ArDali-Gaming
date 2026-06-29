@@ -1,0 +1,26 @@
+# Maintainer: ArDali Gaming <maintainer@example.invalid>
+pkgname=ardali-gaming
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Linux game launcher with portable Wine, Proton, Steam, OpenRA, and DOSBox-X management"
+arch=('x86_64')
+url="https://example.invalid/ardali-gaming"
+license=('custom')
+depends=('webkit2gtk-4.1' 'gtk3' 'curl')
+makedepends=('cargo' 'tauri-cli')
+source=("${pkgname}-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}/src-tauri"
+  cargo tauri build --bundles appimage
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  install -Dm755 src-tauri/target/release/ardali-gaming "${pkgdir}/usr/bin/ardali-gaming"
+  install -Dm644 src-tauri/icons/128x128.png "${pkgdir}/usr/share/icons/hicolor/128x128/apps/ardali-gaming.png"
+  install -Dm644 src-tauri/icons/icon.png "${pkgdir}/usr/share/icons/hicolor/512x512/apps/ardali-gaming.png"
+  install -Dm644 packaging/linux/ardali-gaming.desktop "${pkgdir}/usr/share/applications/com.ardali.gaming.desktop"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/ardali-gaming/README.md"
+}

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ArDali Gaming
+Comment=Linux game launcher with portable Wine, Proton, Steam, OpenRA, and DOSBox-X management
+Exec=ardali-gaming
+Icon=ardali-gaming
+Terminal=false
+Categories=Game;Utility;
+StartupNotify=true
+StartupWMClass=com.ardali.gaming

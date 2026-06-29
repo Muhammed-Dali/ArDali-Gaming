@@ -1,0 +1,61 @@
+{
+  "productName": "ArDali Gaming",
+  "version": "0.1.0",
+  "identifier": "com.ardali.gaming",
+  "build": {
+    "frontendDist": "../frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "enableGTKAppId": true,
+    "windows": [
+      {
+        "title": "ArDali Gaming",
+        "width": 1320,
+        "height": 820,
+        "resizable": true,
+        "decorations": false,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$HOME/Oyunlar/**",
+          "$HOME/.local/share/ardali-gaming/**",
+          "$APPDATA/**",
+          "$APPLOCALDATA/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": [
+      "appimage",
+      "deb",
+      "rpm"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://updates.ardali.local/{{target}}/{{arch}}/{{current_version}}"
+      ]
+    }
+  }
+}

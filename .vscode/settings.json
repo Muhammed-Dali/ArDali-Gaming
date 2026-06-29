@@ -1,0 +1,9 @@
+{
+  "editor.inlayHints.enabled": "off",
+  "search.exclude": {
+    "src-tauri/target": true
+  },
+  "files.watcherExclude": {
+    "src-tauri/target/**": true
+  }
+}

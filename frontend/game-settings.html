@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ayarlar</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="settings-window-page">
+    <header class="window-titlebar settings-titlebar">
+      <div class="window-title">Ayarlar</div>
+      <div class="window-controls">
+        <button type="button" data-window-action="minimize" aria-label="Kucult">_</button>
+        <button type="button" data-window-action="maximize" aria-label="Buyut">□</button>
+        <button type="button" data-window-action="close" aria-label="Kapat">×</button>
+      </div>
+    </header>
+    <main class="settings-window-card">
+      <form id="game-settings-form">
+        <header class="settings-window-header">
+          <div class="settings-heading">
+            <div id="settings-app-icon" class="settings-app-icon" aria-hidden="true"></div>
+            <div>
+              <h2 id="settings-title">Ayarlar</h2>
+              <p id="settings-subtitle">Uyumluluk ve görüntü profili</p>
+            </div>
+          </div>
+          <button id="settings-close" type="button">Kapat</button>
+        </header>
+        <input name="game-id" type="hidden" />
+        <div id="shared-prefix-warning" class="settings-scope-note" hidden></div>
+        <div id="settings-details" class="game-settings-grid"></div>
+        <div id="fullscreen-tool-warning" class="tool-warning" hidden>
+          <span>Eski Wine oyunlarında tam ekran penceresini otomatik büyütmek için ek bir sistem aracı gerekiyor</span>
+          <div class="tool-warning-actions">
+            <button id="install-gamescope-game" type="button">Gamescope Kur</button>
+            <button id="apply-legacy-profile" type="button">Eski Oyun Profili</button>
+            <button id="install-kdotool" type="button">Pencere Aracı Kur</button>
+          </div>
+          <div id="fullscreen-tool-progress" class="tool-progress" hidden>
+            <div class="tool-progress-meta">
+              <span>Kurulum</span>
+              <strong>0%</strong>
+            </div>
+            <div class="tool-progress-track">
+              <div></div>
+            </div>
+          </div>
+        </div>
+        <div class="danger-actions settings-window-danger">
+          <button id="game-settings-remove" value="remove" type="button">Kütüphaneden Sil</button>
+        </div>
+        <div class="settings-actions settings-window-actions">
+          <button id="game-settings-reset" value="reset" type="button">Varsayılana Sıfırla</button>
+          <button id="game-settings-save" value="save" type="submit">Kaydet</button>
+        </div>
+      </form>
+    </main>
+    <script src="./game-settings.js" type="module"></script>
+  </body>
+</html>
