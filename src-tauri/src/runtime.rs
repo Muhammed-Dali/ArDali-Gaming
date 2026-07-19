@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+use ardali_core::{ArdaliEvent, DownloadProgressEvent, LogEvent};
+pub use ardali_core::{GameKind, RunnerKind};
+use serde::Serialize;
 use std::{
     env,
     fs::{self, OpenOptions},
@@ -10,10 +12,13 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter};
 
 const APP_DIR_NAME: &str = "ardali-gaming";
 static DOWNLOAD_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+pub trait RuntimeEventSink {
+    fn publish_event(&self, event: ArdaliEvent) -> Result<(), String>;
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimePaths {
@@ -47,83 +52,12 @@ pub struct RuntimeStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct BackendLog {
-    pub level: String,
-    pub message: String,
-    pub timestamp: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DownloadProgress {
-    pub kind: String,
-    pub percent: u8,
-    pub downloaded_bytes: u64,
-    pub total_bytes: Option<u64>,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct PrefixInfo {
     pub id: String,
     pub name: String,
     pub path: String,
     pub wineprefix: String,
     pub wineboot_ran: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RunnerKind {
-    Wine,
-    Proton,
-    Dxvk,
-    Vkd3d,
-    Openra,
-    DosboxX,
-    Cncnet,
-}
-
-impl RunnerKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Wine => "wine",
-            Self::Proton => "proton",
-            Self::Dxvk => "dxvk",
-            Self::Vkd3d => "vkd3d",
-            Self::Openra => "openra",
-            Self::DosboxX => "dosbox-x",
-            Self::Cncnet => "cncnet",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GameKind {
-    WindowsExe,
-    WindowsMsi,
-    Steam,
-    OpenRaRedAlert,
-    OpenRaTiberianDawn,
-    OpenRaDune2000,
-    Dos,
-    Cncnet,
-}
-
-impl GameKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::WindowsExe => "windows-exe",
-            Self::WindowsMsi => "windows-msi",
-            Self::Steam => "steam",
-            Self::OpenRaRedAlert => "open-ra-red-alert",
-            Self::OpenRaTiberianDawn => "open-ra-tiberian-dawn",
-            Self::OpenRaDune2000 => "open-ra-dune2000",
-            Self::Dos => "dos",
-            Self::Cncnet => "cncnet",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,7 +89,7 @@ pub struct DownloadResult {
     pub extracted: bool,
 }
 
-pub fn initialize(app: &AppHandle) -> Result<RuntimeStatus, String> {
+pub fn initialize(app: &dyn RuntimeEventSink) -> Result<RuntimeStatus, String> {
     let paths = paths()?;
     for dir in [
         &paths.data_dir,
@@ -177,11 +111,16 @@ pub fn initialize(app: &AppHandle) -> Result<RuntimeStatus, String> {
 }
 
 pub fn download_runner(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     kind: RunnerKind,
     url: String,
     file_name: Option<String>,
 ) -> Result<DownloadResult, String> {
+    if kind == RunnerKind::Steam {
+        return Err(
+            "Steam sistem tarafından yönetilir ve portable runtime olarak indirilemez".into(),
+        );
+    }
     if url.trim().is_empty() {
         return Err("Download URL cannot be empty.".into());
     }
@@ -314,7 +253,7 @@ pub fn cancel_download() {
     DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst);
 }
 
-pub fn initialize_emulators(app: &AppHandle) -> Result<EmulatorStatus, String> {
+pub fn initialize_emulators(app: &dyn RuntimeEventSink) -> Result<EmulatorStatus, String> {
     let paths = paths()?;
     for dir in [
         &paths.emulators_dir,
@@ -332,7 +271,7 @@ pub fn initialize_emulators(app: &AppHandle) -> Result<EmulatorStatus, String> {
 }
 
 pub fn download_emulator(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     kind: RunnerKind,
     url: String,
     file_name: Option<String>,
@@ -365,11 +304,10 @@ pub fn select_runner(
             notes: "Windows MSI packages use msiexec through the isolated Wine runner".into(),
         },
         GameKind::Steam => RunnerSelection {
-            runner: "proton".into(),
-            executable: Some(preferred_proton_executable(&paths)),
-            arguments: vec![target],
-            notes: "Steam games will prefer the detected Steam Proton runtime in a later step."
-                .into(),
+            runner: RunnerKind::Steam.as_str().into(),
+            executable: command_path("steam"),
+            arguments: vec!["-applaunch".into(), target],
+            notes: "Steam games are launched by AppID through the Steam client.".into(),
         },
         GameKind::OpenRaRedAlert => openra_selection(&paths, "red-alert", target),
         GameKind::OpenRaTiberianDawn => openra_selection(&paths, "tiberian-dawn", target),
@@ -418,16 +356,11 @@ fn preferred_wine_executable(paths: &RuntimePaths) -> String {
     command_path("wine").unwrap_or_else(|| path_string(portable))
 }
 
-fn preferred_proton_executable(paths: &RuntimePaths) -> String {
-    let portable = Path::new(&paths.proton_dir).join("current/proton");
-    if portable.exists() {
-        return path_string(portable);
-    }
-
-    command_path("proton").unwrap_or_else(|| path_string(portable))
-}
-
-pub fn create_prefix(app: &AppHandle, game_id: String, name: String) -> Result<PrefixInfo, String> {
+pub fn create_prefix(
+    app: &dyn RuntimeEventSink,
+    game_id: String,
+    name: String,
+) -> Result<PrefixInfo, String> {
     let paths = paths()?;
     let prefix_id = sanitize_id(&game_id);
     if prefix_id.is_empty() {
@@ -458,7 +391,7 @@ pub fn create_prefix(app: &AppHandle, game_id: String, name: String) -> Result<P
 }
 
 pub fn install_graphics_components(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     prefix_id: String,
 ) -> Result<PrefixInfo, String> {
     let paths = paths()?;
@@ -523,7 +456,7 @@ pub fn install_graphics_components(
 }
 
 fn run_component_setup(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     component_dir: &Path,
     script_name: &str,
     wineprefix: &Path,
@@ -696,7 +629,7 @@ fn parse_wine_major_version(value: &str) -> Option<u32> {
 }
 
 fn run_wineboot_if_available(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     paths: &RuntimePaths,
     wineprefix: &Path,
 ) -> Result<bool, String> {
@@ -712,6 +645,7 @@ fn run_wineboot_if_available(
 
     let status = Command::new(wine)
         .env("WINEPREFIX", wineprefix)
+        .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
         .arg("wineboot")
         .arg("-u")
         .status()
@@ -745,7 +679,7 @@ fn write_prefix_manifest(
 }
 
 fn extract_archive(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     archive_path: &Path,
     install_dir: &Path,
 ) -> Result<bool, String> {
@@ -779,7 +713,7 @@ fn extract_archive(
 }
 
 fn install_downloaded_file(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     archive_path: &Path,
     install_dir: &Path,
 ) -> Result<bool, String> {
@@ -955,34 +889,32 @@ fn write_dosbox_config(paths: &RuntimePaths) -> Result<(), String> {
     .map_err(|error| format!("Cannot write DOSBox-X config: {error}"))
 }
 
-fn emit_log(app: &AppHandle, level: &str, message: &str) -> Result<(), String> {
-    let log = BackendLog {
+fn emit_log(app: &dyn RuntimeEventSink, level: &str, message: &str) -> Result<(), String> {
+    let log = LogEvent {
         level: level.into(),
         message: message.into(),
         timestamp: unix_timestamp(),
     };
     persist_log(&log)?;
-    app.emit("backend-log", &log)
-        .map_err(|error| format!("Cannot emit backend log: {error}"))
+    app.publish_event(ArdaliEvent::Log(log))
 }
 
 fn emit_download_progress(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     kind: &RunnerKind,
     percent: u8,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
     status: &str,
 ) -> Result<(), String> {
-    let progress = DownloadProgress {
+    let progress = DownloadProgressEvent {
         kind: kind.as_str().to_string(),
         percent: percent.clamp(1, 100),
         downloaded_bytes,
         total_bytes,
         status: status.to_string(),
     };
-    app.emit("download-progress", &progress)
-        .map_err(|error| format!("Cannot emit download progress: {error}"))
+    app.publish_event(ArdaliEvent::DownloadProgress(progress))
 }
 
 fn remote_content_length(url: &str) -> Option<u64> {
@@ -1024,11 +956,15 @@ fn download_percent(downloaded_bytes: u64, total_bytes: Option<u64>) -> u8 {
     percent.clamp(1, 99) as u8
 }
 
-pub fn emit_backend_log(app: &AppHandle, level: &str, message: &str) -> Result<(), String> {
+pub fn emit_backend_log(
+    app: &dyn RuntimeEventSink,
+    level: &str,
+    message: &str,
+) -> Result<(), String> {
     emit_log(app, level, message)
 }
 
-fn persist_log(log: &BackendLog) -> Result<(), String> {
+fn persist_log(log: &LogEvent) -> Result<(), String> {
     let paths = paths()?;
     fs::create_dir_all(&paths.logs_dir)
         .map_err(|error| format!("Cannot create logs directory: {error}"))?;
@@ -1052,6 +988,7 @@ fn default_archive_name(kind: &RunnerKind, url: &str) -> String {
 fn install_dir(paths: &RuntimePaths, kind: &RunnerKind) -> PathBuf {
     match kind {
         RunnerKind::Wine => Path::new(&paths.wine_dir).join("current"),
+        RunnerKind::Steam => Path::new(&paths.components_dir).join("steam-system"),
         RunnerKind::Proton => Path::new(&paths.proton_dir).join("current"),
         RunnerKind::Dxvk => Path::new(&paths.components_dir).join("dxvk/current"),
         RunnerKind::Vkd3d => Path::new(&paths.components_dir).join("vkd3d/current"),

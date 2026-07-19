@@ -3,8 +3,12 @@ mod database;
 mod metadata;
 mod runtime;
 mod steam;
+mod tauri_events;
 mod updates;
 
+use ardali_core::{
+    ArdaliEvent, CncNetInstallProgressEvent, DownloadProgressEvent, GameProcessEvent,
+};
 use compatibility::{CompatibilitySettings, ProtonDbSummary, TroubleshootingReport};
 use database::{
     AppSetting, DisplayMode, GameInstallRequest, GameModeOptions, GameRecord, GameSettingsUpdate,
@@ -13,7 +17,7 @@ use database::{
 use metadata::MetadataResult;
 use runtime::{
     DownloadResult, EmulatorStatus, GameKind, PrefixInfo, RunnerKind, RunnerSelection,
-    RuntimeStatus,
+    RuntimeEventSink, RuntimeStatus,
 };
 use serde_json::Value;
 use std::{
@@ -24,19 +28,13 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use steam::SteamScan;
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use steam::{SteamCompatibilityStatus, SteamCompatibilityUpdate};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_events::TauriEventSink;
 use updates::{ComponentUpdate, ComponentUpdateRequest};
-
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GameProcessEvent {
-    id: i64,
-    name: String,
-    status: String,
-}
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,14 +43,7 @@ struct WindowsFilePreview {
     path: String,
     kind: String,
     icon_path: Option<String>,
-}
-
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CncNetInstallProgress {
-    id: i64,
-    percent: u8,
-    status: String,
+    mode: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -62,6 +53,7 @@ struct FullscreenToolStatus {
     wmctrl: bool,
     xdotool: bool,
     gamescope: bool,
+    gamemode: bool,
     has_any_tool: bool,
     has_recommended_tool: bool,
     session_type: String,
@@ -71,6 +63,15 @@ struct FullscreenToolStatus {
     warning: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameModeTestResult {
+    installed: bool,
+    passed: bool,
+    message: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct LaunchCommand {
     executable: String,
     args: Vec<String>,
@@ -85,7 +86,7 @@ struct StagedInstaller {
 #[tauri::command]
 fn initialize_runtime(app: AppHandle) -> Result<RuntimeStatus, String> {
     database::initialize()?;
-    runtime::initialize(&app)
+    runtime::initialize(&TauriEventSink::new(&app))
 }
 
 #[tauri::command]
@@ -95,12 +96,12 @@ fn download_portable_runner(
     url: String,
     file_name: Option<String>,
 ) -> Result<DownloadResult, String> {
-    runtime::download_runner(&app, kind, url, file_name)
+    runtime::download_runner(&TauriEventSink::new(&app), kind, url, file_name)
 }
 
 #[tauri::command]
 fn initialize_emulators(app: AppHandle) -> Result<EmulatorStatus, String> {
-    runtime::initialize_emulators(&app)
+    runtime::initialize_emulators(&TauriEventSink::new(&app))
 }
 
 #[tauri::command]
@@ -110,7 +111,7 @@ fn download_portable_emulator(
     url: String,
     file_name: Option<String>,
 ) -> Result<DownloadResult, String> {
-    runtime::download_emulator(&app, kind, url, file_name)
+    runtime::download_emulator(&TauriEventSink::new(&app), kind, url, file_name)
 }
 
 #[tauri::command]
@@ -123,12 +124,12 @@ fn select_game_runner(
 
 #[tauri::command]
 fn create_wine_prefix(app: AppHandle, game_id: String, name: String) -> Result<PrefixInfo, String> {
-    runtime::create_prefix(&app, game_id, name)
+    runtime::create_prefix(&TauriEventSink::new(&app), game_id, name)
 }
 
 #[tauri::command]
 fn install_dxvk_vkd3d(app: AppHandle, prefix_id: String) -> Result<PrefixInfo, String> {
-    runtime::install_graphics_components(&app, prefix_id)
+    runtime::install_graphics_components(&TauriEventSink::new(&app), prefix_id)
 }
 
 #[tauri::command]
@@ -177,7 +178,13 @@ fn pick_folder() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn windows_file_preview(path: String) -> Result<WindowsFilePreview, String> {
+async fn windows_file_preview(path: String) -> Result<WindowsFilePreview, String> {
+    tauri::async_runtime::spawn_blocking(move || windows_file_preview_blocking(path))
+        .await
+        .map_err(|error| format!("Windows dosyası önizleme görevi tamamlanamadı: {error}"))?
+}
+
+fn windows_file_preview_blocking(path: String) -> Result<WindowsFilePreview, String> {
     let file_path = PathBuf::from(&path);
     if !file_path.is_file() {
         return Err("Seçilen yol dosya değil".into());
@@ -196,6 +203,7 @@ fn windows_file_preview(path: String) -> Result<WindowsFilePreview, String> {
     } else {
         None
     };
+    let mode = detect_windows_file_mode(&file_path)?;
 
     Ok(WindowsFilePreview {
         name,
@@ -206,7 +214,68 @@ fn windows_file_preview(path: String) -> Result<WindowsFilePreview, String> {
             "EXE".into()
         },
         icon_path,
+        mode,
     })
+}
+
+fn detect_windows_file_mode(path: &Path) -> Result<String, String> {
+    if has_extension(path, "msi") {
+        return Ok("installer".into());
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ["setup", "install", "installer", "websetup", "bootstrap"]
+        .iter()
+        .any(|marker| file_name.contains(marker))
+    {
+        return Ok("installer".into());
+    }
+
+    let bytes = fs::read(path).map_err(|error| format!("EXE incelenemedi: {error}"))?;
+    if has_installer_signature(&bytes) {
+        Ok("installer".into())
+    } else {
+        Ok("direct".into())
+    }
+}
+
+fn has_installer_signature(bytes: &[u8]) -> bool {
+    const MARKERS: &[&str] = &[
+        "installshield wizard",
+        "installshield silent",
+        "inno setup",
+        "nullsoft install system",
+        "nsis error",
+        "setup initialization error",
+        "preparing to install",
+        "windows installer",
+    ];
+
+    MARKERS.iter().any(|marker| {
+        contains_ascii_case_insensitive(bytes, marker.as_bytes())
+            || contains_utf16le_case_insensitive(bytes, marker)
+    })
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    })
+}
+
+fn contains_utf16le_case_insensitive(haystack: &[u8], needle: &str) -> bool {
+    let encoded = needle
+        .bytes()
+        .flat_map(|byte| [byte, 0])
+        .collect::<Vec<_>>();
+    contains_ascii_case_insensitive(haystack, &encoded)
 }
 
 #[tauri::command]
@@ -215,6 +284,7 @@ fn fullscreen_tool_status() -> FullscreenToolStatus {
     let wmctrl = command_exists("wmctrl");
     let xdotool = command_exists("xdotool");
     let gamescope = command_exists("gamescope");
+    let gamemode = command_exists("gamemoderun");
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into());
     let desktop_environment = std::env::var("XDG_CURRENT_DESKTOP")
         .or_else(|_| std::env::var("DESKTOP_SESSION"))
@@ -237,6 +307,7 @@ fn fullscreen_tool_status() -> FullscreenToolStatus {
         wmctrl,
         xdotool,
         gamescope,
+        gamemode,
         has_any_tool: kdotool || wmctrl || xdotool,
         has_recommended_tool,
         session_type,
@@ -245,6 +316,41 @@ fn fullscreen_tool_status() -> FullscreenToolStatus {
         install_label,
         warning,
     }
+}
+
+#[tauri::command]
+async fn test_gamemode() -> Result<GameModeTestResult, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(executable) = command_path("gamemoded") else {
+            return Ok(GameModeTestResult {
+                installed: false,
+                passed: false,
+                message: "gamemoded bulunamadı dağıtımının gamemode paketini kur".into(),
+            });
+        };
+        let output = Command::new(executable)
+            .arg("-t")
+            .output()
+            .map_err(|error| format!("GameMode testi başlatılamadı: {error}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = [stdout, stderr]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        Ok(GameModeTestResult {
+            installed: true,
+            passed: output.status.success(),
+            message: if message.is_empty() {
+                output.status.to_string()
+            } else {
+                message
+            },
+        })
+    })
+    .await
+    .map_err(|error| format!("GameMode test görevi tamamlanamadı: {error}"))?
 }
 
 #[tauri::command]
@@ -350,6 +456,24 @@ fn remove_fullscreen_tool_blocking() -> Result<FullscreenToolStatus, String> {
 
 #[tauri::command]
 fn run_game_installer(app: AppHandle, request: GameInstallRequest) -> Result<(), String> {
+    eprintln!(
+        "[ardali-installer] request name='{}' path='{}'",
+        request.name, request.installer_path
+    );
+    thread::spawn(move || {
+        let handle = app.clone();
+        if let Err(error) = run_game_installer_blocking(app, request) {
+            eprintln!("[ardali-installer] failed: {error}");
+            let _ = runtime::emit_backend_log(&handle, "error", &error);
+            let _ = emit_install_progress(&handle, 100, &format!("Kurulum başlatılamadı: {error}"));
+        }
+    });
+    Ok(())
+}
+
+fn run_game_installer_blocking(app: AppHandle, request: GameInstallRequest) -> Result<(), String> {
+    eprintln!("[ardali-installer] preparing Wine prefix");
+    emit_install_progress(&app, 5, "Wine ortamı hazırlanıyor")?;
     validate_install_request(&request, false)?;
     let wine = wine_executable()?;
 
@@ -358,6 +482,7 @@ fn run_game_installer(app: AppHandle, request: GameInstallRequest) -> Result<(),
         .map_err(|error| format!("Kurulum klasörü oluşturulamadı: {error}"))?;
     let (prefix_id, prefix_name) = prefix_identity(&request);
     let prefix = runtime::create_prefix(&app, prefix_id, prefix_name)?;
+    emit_install_progress(&app, 25, "Wine prefix hazır kurulum dosyası hazırlanıyor")?;
     stop_wine_processes(&app, &wine, &prefix.wineprefix);
     let staged_installer =
         stage_installer_for_wine(&app, &request.installer_path, &prefix.wineprefix)?;
@@ -383,25 +508,54 @@ fn run_game_installer(app: AppHandle, request: GameInstallRequest) -> Result<(),
         }
     };
 
+    eprintln!("[ardali-installer] Wine installer process started");
+
     runtime::emit_backend_log(
         &app,
         "info",
         &format!("Installer başlatıldı: {}", request.installer_path),
     )?;
+    emit_install_progress(&app, 40, "Kurulum sihirbazı açıldı tamamlanması bekleniyor")?;
 
     let handle = app.clone();
     thread::spawn(move || {
-        let status = child.wait();
+        // Do not wait for the wizard process when the installed executable is
+        // already present. Some InstallShield launchers keep a helper process
+        // alive for minutes after the actual installation is finished.
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if find_installed_windows_executable(
+                        &prefix.wineprefix,
+                        &install_dir,
+                        &request.installer_path,
+                        scan_started_at,
+                    )
+                    .is_some()
+                    {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+                Err(_) => break None,
+            }
+        };
         let prefix_path = prefix.wineprefix;
         match status {
-            Ok(exit_status) if exit_status.success() => {
+            Some(exit_status) if exit_status.success() => {
                 let _ = runtime::emit_backend_log(
                     &handle,
                     "info",
                     "Installer tamamlandı kurulan uygulama aranıyor",
                 );
+                let _ = emit_install_progress(
+                    &handle,
+                    75,
+                    "Kurulum tamamlandı uygulama ve simge aranıyor",
+                );
             }
-            Ok(exit_status) => {
+            Some(exit_status) => {
                 let _ = runtime::emit_backend_log(
                     &handle,
                     "warn",
@@ -409,16 +563,27 @@ fn run_game_installer(app: AppHandle, request: GameInstallRequest) -> Result<(),
                         "Installer çıkış kodu başarılı değil {exit_status} yine de uygulama aranıyor"
                     ),
                 );
-            }
-            Err(error) => {
-                let _ = runtime::emit_backend_log(
+                // InstallShield can return exit code 1 after a successful
+                // install; keep scanning before declaring the operation failed.
+                let _ = emit_install_progress(
                     &handle,
-                    "warn",
-                    &format!("Installer bitiş durumu okunamadı: {error}"),
+                    75,
+                    "Kurulum penceresi kapandı uygulama aranıyor",
+                );
+            }
+            None => {
+                let _ = emit_install_progress(
+                    &handle,
+                    75,
+                    "Kurulum penceresi kapandı uygulama aranıyor",
                 );
             }
         }
-        wait_for_wine_processes(&handle, &wine, &prefix_path);
+        // Keep the modal operation active while scanning and registering the
+        // installed executable. Completion is emitted only after that succeeds.
+        // The installer child has already exited and its files are visible.
+        // Do not wait for unrelated wineserver/background processes here:
+        // that adds several seconds before the card can appear.
         if let Err(error) = add_installed_app_after_installer(
             &handle,
             request,
@@ -431,10 +596,27 @@ fn run_game_installer(app: AppHandle, request: GameInstallRequest) -> Result<(),
                 "warn",
                 &format!("Kurulum sonrası kütüphane kaydı eklenemedi: {error}"),
             );
+            let _ = emit_install_progress(
+                &handle,
+                100,
+                &format!("Kurulum tamamlandı ancak uygulama eklenemedi: {error}"),
+            );
+        } else {
+            let _ = emit_install_progress(&handle, 100, "Uygulama kütüphaneye eklendi");
         }
         cleanup_staged_installer(&handle, &staged_installer.host_path);
     });
     Ok(())
+}
+
+fn emit_install_progress(app: &AppHandle, percent: u8, status: &str) -> Result<(), String> {
+    app.publish_event(ArdaliEvent::InstallProgress(DownloadProgressEvent {
+        kind: "windows-installer".into(),
+        percent,
+        downloaded_bytes: 0,
+        total_bytes: None,
+        status: status.into(),
+    }))
 }
 
 fn stage_installer_for_wine(
@@ -542,20 +724,50 @@ fn wait_for_wine_processes(app: &AppHandle, wine: &str, prefix_path: &str) {
         return;
     };
 
-    let status = Command::new(wineserver)
+    let mut child = match Command::new(wineserver)
         .arg("-w")
         .env("WINEPREFIX", prefix_path)
         .env("WINEARCH", "win64")
         .env("WINEDEBUG", "-all")
-        .status();
-    if let Err(error) = status {
-        let _ = runtime::emit_backend_log(
-            app,
-            "warn",
-            &format!("Wine işlem bekleme tamamlanamadı: {error}"),
-        );
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = runtime::emit_backend_log(
+                app,
+                "warn",
+                &format!("Wine işlem bekleme başlatılamadı: {error}"),
+            );
+            thread::sleep(Duration::from_millis(500));
+            return;
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = runtime::emit_backend_log(
+                    app,
+                    "warn",
+                    "Wine süreçleri 8 saniye içinde kapanmadı; uygulama taraması devam ediyor",
+                );
+                break;
+            }
+            Err(error) => {
+                let _ = runtime::emit_backend_log(
+                    app,
+                    "warn",
+                    &format!("Wine işlem durumu okunamadı: {error}"),
+                );
+                break;
+            }
+        }
     }
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_millis(500));
 }
 
 fn stop_wine_processes(app: &AppHandle, wine: &str, prefix_path: &str) {
@@ -604,6 +816,10 @@ fn add_installed_app_after_installer(
     install_dir: String,
     scan_started_at: SystemTime,
 ) -> Result<(), String> {
+    // Extract the installer icon before replacing its path with the installed
+    // executable. This gives the card an immediate, meaningful icon while the
+    // final application icon is enriched asynchronously afterward.
+    let installer_icon = extract_windows_icon_preview(Path::new(&request.installer_path)).ok();
     let installed_executable = find_installed_windows_executable(
         &prefix_path,
         &install_dir,
@@ -622,32 +838,58 @@ fn add_installed_app_after_installer(
     request.library_type = Some(LibraryType::WindowsApp);
     request.installer_path = installed_executable;
     request.install_dir = Some(installed_dir);
+    if Path::new(&request.installer_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("brave.exe"))
+    {
+        request.name = "Brave Browser".into();
+    }
 
     let selection = runtime::select_runner(
         request.game_kind.clone(),
         Some(request.installer_path.clone()),
     )?;
     let record = database::add_game(request, &selection, Some(prefix_path))?;
-    apply_windows_version(app, &record)?;
-    extract_windows_icon_for_record(app, &record);
+    if let Some(icon_path) = installer_icon {
+        let _ = database::save_metadata(
+            record.id,
+            Some(icon_path),
+            None,
+            None,
+            None,
+            None,
+            "windows-installer-icon".into(),
+        );
+    }
+    // Publish the record first so the card is visible immediately. Icon
+    // extraction is metadata enrichment and must not delay library refresh.
+    let _ = app.publish_event(ArdaliEvent::LibraryChanged {
+        id: Some(record.id),
+    });
     runtime::emit_backend_log(
         app,
         "info",
         &format!("Kurulum tamamlandı ve kütüphaneye eklendi: {}", record.name),
     )?;
-    let _ = app.emit("library-changed", &record);
+    let icon_app = app.clone();
+    let icon_record = record.clone();
+    thread::spawn(move || extract_windows_icon_for_record(&icon_app, &icon_record));
     Ok(())
 }
 
 fn find_installed_windows_executable(
     prefix_path: &str,
-    install_dir: &str,
+    _install_dir: &str,
     installer_path: &str,
     _scan_started_at: SystemTime,
 ) -> Option<String> {
     let drive_c = Path::new(prefix_path).join("drive_c");
+    // Prefer the isolated prefix. The original installer directory can be a
+    // large Downloads tree and recursively scanning it made registration look
+    // frozen (and could outlive the UI). It is only a fallback for portable
+    // installers that explicitly place files beside the installer.
     let roots = [
-        PathBuf::from(install_dir),
         drive_c.join("Program Files"),
         drive_c.join("Program Files (x86)"),
     ];
@@ -656,6 +898,11 @@ fn find_installed_windows_executable(
     for root in roots {
         collect_executable_candidates(&root, installer, &mut candidates);
     }
+    eprintln!(
+        "[ardali-installer] executable scan found {} candidates in {}",
+        candidates.len(),
+        prefix_path
+    );
     candidates
         .into_iter()
         .max_by_key(|candidate| executable_score(&candidate.0, candidate.1))
@@ -683,6 +930,9 @@ fn collect_executable_candidates(
         if !has_extension(&path, "exe")
             || same_path(&path, installer)
             || is_helper_executable(&path)
+            || detect_windows_file_mode(&path)
+                .map(|mode| mode == "installer")
+                .unwrap_or(false)
             || is_wine_system_executable(&path)
         {
             continue;
@@ -704,7 +954,9 @@ fn executable_score(path: &Path, modified: SystemTime) -> (u8, SystemTime) {
         .unwrap_or_default()
         .to_ascii_lowercase();
     let name_without_ext = name.strip_suffix(".exe").unwrap_or(&name);
-    let score = if name_without_ext == parent {
+    let score = if name == "brave.exe" {
+        250
+    } else if name_without_ext == parent {
         5
     } else if parent.contains(name_without_ext) || name_without_ext.contains(&parent) {
         4
@@ -736,6 +988,11 @@ fn is_helper_executable(path: &Path) -> bool {
         "install",
         "installer",
         "update",
+        "crashhandler",
+        "vpn_",
+        "elevation_service",
+        "notification_helper",
+        "chrome_pwa_launcher",
     ]
     .iter()
     .any(|needle| name.contains(needle))
@@ -838,7 +1095,8 @@ fn pick_file_with_portal() -> Result<Option<String>, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let handle = parse_portal_handle(&stdout).ok_or_else(|| "Portal cevabı okunamadı".to_string())?;
+    let handle =
+        parse_portal_handle(&stdout).ok_or_else(|| "Portal cevabı okunamadı".to_string())?;
     wait_for_portal_file_response(&handle)
 }
 
@@ -875,7 +1133,9 @@ fn wait_for_portal_file_response(handle: &str) -> Result<Option<String>, String>
             continue;
         }
         let result = if line.contains("uint32 0") {
-            parse_first_file_uri(&line).map(|uri| file_uri_to_path(&uri)).transpose()
+            parse_first_file_uri(&line)
+                .map(|uri| file_uri_to_path(&uri))
+                .transpose()
         } else {
             Ok(None)
         };
@@ -892,7 +1152,10 @@ fn wait_for_portal_file_response(handle: &str) -> Result<Option<String>, String>
 fn parse_first_file_uri(line: &str) -> Option<String> {
     let start = line.find("file://")?;
     let rest = line.get(start..)?;
-    let end = rest.find('\'').or_else(|| rest.find('"')).unwrap_or(rest.len());
+    let end = rest
+        .find('\'')
+        .or_else(|| rest.find('"'))
+        .unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
 
@@ -1030,7 +1293,7 @@ fn launch_game(app: AppHandle, id: i64, options: GameModeOptions) -> Result<Game
             None
         };
         let base_executable = effective_executable(runner, executable)?;
-        let base_launch_args = if runner == "cncnet" {
+        let mut base_launch_args = if runner == "cncnet" {
             cncnet_client
                 .as_ref()
                 .map(|path| vec![path.to_string_lossy().into_owned()])
@@ -1040,6 +1303,14 @@ fn launch_game(app: AppHandle, id: i64, options: GameModeOptions) -> Result<Game
         } else {
             source.arguments.clone()
         };
+        if source.game_kind == "steam" && !source.steam_launch_options.trim().is_empty() {
+            let (_, extra_arguments) = split_windows_command_line(&format!(
+                "steam-options {}",
+                source.steam_launch_options
+            ))
+            .ok_or_else(|| "Steam başlatma seçeneklerinde kapanmamış tırnak var".to_string())?;
+            base_launch_args.extend(extra_arguments);
+        }
         let launch_command =
             launch_command(&app, &source, runner, &base_executable, base_launch_args)?;
         eprintln!(
@@ -1083,6 +1354,8 @@ fn launch_game(app: AppHandle, id: i64, options: GameModeOptions) -> Result<Game
         let mut child = command
             .spawn()
             .map_err(|error| format!("Cannot launch game runner: {error}"))?;
+        let game = database::mark_game_launched(id, &effective_options)?;
+        runtime::emit_backend_log(&app, "info", &format!("Launch requested: {}", game.name))?;
         let desktop_title_for_monitor = should_auto_fullscreen_wine_desktop(&source, runner)
             .then(|| format!("{} - Wine Desktop", wine_desktop_name(&source.name)));
         if should_auto_fullscreen_wine_desktop(&source, runner) {
@@ -1094,17 +1367,52 @@ fn launch_game(app: AppHandle, id: i64, options: GameModeOptions) -> Result<Game
         }
         let handle = app.clone();
         let name = source.name.clone();
+        let steam_app_id = (source.game_kind == "steam")
+            .then(|| steam_app_id(&source))
+            .flatten();
+        let steam_options = effective_options.clone();
         thread::spawn(move || {
-            let status = monitor_game_process(&mut child, desktop_title_for_monitor.as_deref());
+            let (status, steam_started) = if let Some(app_id) = steam_app_id {
+                let result = monitor_steam_game_process(&mut child, &app_id, || {
+                    let _ = database::clear_play_session(id);
+                    let _ = database::mark_game_launched(id, &steam_options);
+                    let _ = handle.publish_event(ArdaliEvent::GameStarted(GameProcessEvent {
+                        id,
+                        name: name.clone(),
+                        status: "running".into(),
+                    }));
+                });
+                (result.0, result.1)
+            } else {
+                let _ = handle.publish_event(ArdaliEvent::GameStarted(GameProcessEvent {
+                    id,
+                    name: name.clone(),
+                    status: "running".into(),
+                }));
+                (
+                    monitor_game_process(&mut child, desktop_title_for_monitor.as_deref()),
+                    true,
+                )
+            };
             eprintln!("[ardali-launch-ended] id={id} name='{name}' status={status}");
-            let _ = database::finish_play_session(id);
-            let _ = handle.emit("game-ended", GameProcessEvent { id, name, status });
+            if steam_started {
+                let _ = database::finish_play_session(id);
+            } else {
+                let _ = database::clear_play_session(id);
+            }
+            let _ = handle.publish_event(ArdaliEvent::GameEnded(GameProcessEvent {
+                id,
+                name,
+                status,
+            }));
         });
+        return Ok(game);
     }
 
-    let game = database::mark_game_launched(id, &effective_options)?;
-    runtime::emit_backend_log(&app, "info", &format!("Launch requested: {}", game.name))?;
-    Ok(game)
+    Err(format!(
+        "{} için çalıştırılabilir başlatıcı bulunamadı",
+        source.name
+    ))
 }
 
 fn monitor_game_process(child: &mut Child, desktop_title: Option<&str>) -> String {
@@ -1129,6 +1437,96 @@ fn monitor_game_process(child: &mut Child, desktop_title: Option<&str>) -> Strin
         checks = checks.saturating_add(1);
         thread::sleep(std::time::Duration::from_millis(1000));
     }
+}
+
+fn steam_app_id(game: &GameRecord) -> Option<String> {
+    game.arguments
+        .windows(2)
+        .find(|pair| pair[0] == "-applaunch")
+        .map(|pair| pair[1].clone())
+        .or_else(|| game.game_id.strip_prefix("steam-").map(ToString::to_string))
+        .filter(|app_id| {
+            !app_id.is_empty() && app_id.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
+fn monitor_steam_game_process(
+    child: &mut Child,
+    app_id: &str,
+    on_started: impl FnOnce(),
+) -> (String, bool) {
+    const START_TIMEOUT_CHECKS: u32 = 60;
+    const END_CONFIRMATION_CHECKS: u8 = 3;
+    let mut started = false;
+    let mut missing_checks = 0_u8;
+    let mut launcher_status = None;
+    let mut on_started = Some(on_started);
+
+    for check in 0.. {
+        if launcher_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => launcher_status = Some(status.to_string()),
+                Ok(None) => {}
+                Err(error) => {
+                    launcher_status = Some(format!("Steam launcher wait failed: {error}"))
+                }
+            }
+        }
+
+        if steam_app_process_running(app_id) {
+            if !started {
+                started = true;
+                if let Some(callback) = on_started.take() {
+                    callback();
+                }
+            }
+            missing_checks = 0;
+        } else if started {
+            missing_checks = missing_checks.saturating_add(1);
+            if missing_checks >= END_CONFIRMATION_CHECKS {
+                return ("Steam game process ended".into(), true);
+            }
+        } else if check >= START_TIMEOUT_CHECKS {
+            return (
+                launcher_status.unwrap_or_else(|| "Steam game start timed out".into()),
+                false,
+            );
+        }
+
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    unreachable!()
+}
+
+fn steam_app_process_running(app_id: &str) -> bool {
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return false;
+    };
+
+    processes.flatten().any(|process| {
+        process
+            .file_name()
+            .to_string_lossy()
+            .chars()
+            .all(|character| character.is_ascii_digit())
+            && fs::read(process.path().join("environ"))
+                .map(|environment| environment_matches_steam_app(&environment, app_id))
+                .unwrap_or(false)
+    })
+}
+
+fn environment_matches_steam_app(environment: &[u8], app_id: &str) -> bool {
+    environment.split(|byte| *byte == 0).any(|variable| {
+        [b"SteamAppId=".as_slice(), b"SteamGameId=".as_slice()]
+            .iter()
+            .any(|prefix| {
+                variable
+                    .strip_prefix(*prefix)
+                    .map(|value| value == app_id.as_bytes())
+                    .unwrap_or(false)
+            })
+    })
 }
 
 fn effective_runner(game: &GameRecord) -> &str {
@@ -1171,14 +1569,47 @@ fn launch_command(
     executable: &str,
     args: Vec<String>,
 ) -> Result<LaunchCommand, String> {
-    if runner == "wine" && game.gamescope_enabled && game.display_mode == "fullscreen" {
-        return gamescope_launch_command(app, game, executable, args);
+    let command = if runner == "wine" && game.gamescope_enabled && game.display_mode == "fullscreen"
+    {
+        gamescope_launch_command(app, game, executable, args)?
+    } else {
+        LaunchCommand {
+            executable: executable.to_string(),
+            args,
+        }
+    };
+
+    gamemode_launch_command(app, game, command)
+}
+
+fn gamemode_launch_command(
+    app: &AppHandle,
+    game: &GameRecord,
+    command: LaunchCommand,
+) -> Result<LaunchCommand, String> {
+    if !game.gamemode_enabled {
+        return Ok(command);
     }
 
-    Ok(LaunchCommand {
-        executable: executable.to_string(),
+    let Some(gamemoderun) = command_path("gamemoderun") else {
+        runtime::emit_backend_log(
+            app,
+            "warn",
+            "GameMode etkin ancak gamemoderun bulunamadı oyun normal başlatılıyor",
+        )?;
+        return Ok(command);
+    };
+
+    Ok(wrap_with_gamemode(command, gamemoderun))
+}
+
+fn wrap_with_gamemode(command: LaunchCommand, gamemoderun: String) -> LaunchCommand {
+    let mut args = vec![command.executable];
+    args.extend(command.args);
+    LaunchCommand {
+        executable: gamemoderun,
         args,
-    })
+    }
 }
 
 fn gamescope_launch_command(
@@ -1352,15 +1783,13 @@ fn emit_cncnet_install_progress(
     percent: u8,
     status: &str,
 ) -> Result<(), String> {
-    app.emit(
-        "cncnet-install-progress",
-        CncNetInstallProgress {
+    app.publish_event(ArdaliEvent::CncNetInstallProgress(
+        CncNetInstallProgressEvent {
             id,
             percent,
             status: status.into(),
         },
-    )
-    .map_err(|error| format!("CnCNet ilerleme olayı gönderilemedi: {error}"))
+    ))
 }
 
 fn wine_virtual_desktop_arguments(game: &GameRecord) -> Vec<String> {
@@ -1578,8 +2007,6 @@ fn recommended_fullscreen_tool(session_type: &str, desktop_environment: &str) ->
         "wmctrl/xdotool".into()
     } else if session == "wayland" && desktop.contains("kde") {
         "kdotool".into()
-    } else if session == "wayland" {
-        "unsupported".into()
     } else {
         "unsupported".into()
     }
@@ -1941,7 +2368,7 @@ fn push_unique_override(overrides: &mut Vec<String>, value: &str) {
 #[tauri::command]
 fn remove_game(app: AppHandle, id: i64, remove_files: bool) -> Result<(), String> {
     database::remove_game(id, remove_files)?;
-    let _ = app.emit("library-changed", id);
+    let _ = app.publish_event(ArdaliEvent::LibraryChanged { id: Some(id) });
     Ok(())
 }
 
@@ -1959,6 +2386,42 @@ async fn uninstall_windows_app(app: AppHandle, id: i64) -> Result<(), String> {
         .map_err(|error| format!("Windows kaldırma görevi tamamlanamadı: {error}"))?
 }
 
+#[tauri::command]
+fn open_wine_uninstaller(id: i64) -> Result<(), String> {
+    let game = database::get_game_by_id(id)?;
+    let prefix = game.prefix_path.clone().ok_or("Wine prefix bulunamadı")?;
+    let wine = wine_executable()?;
+    let mut command = Command::new(&wine);
+    command.env("WINEPREFIX", &prefix).env("WINEARCH", "win64");
+    if let Some(value) = find_uninstall_string(&prefix, &game, &game.installer_path) {
+        if let Some((exe, mut args)) = split_windows_command_line(&value) {
+            if value.to_ascii_lowercase().contains("brave")
+                && !args.iter().any(|arg| arg == "--force-uninstall")
+            {
+                args.push("--force-uninstall".into());
+            }
+            let host_exe = if exe.to_ascii_lowercase().starts_with("c:\\") {
+                Path::new(&prefix)
+                    .join("drive_c")
+                    .join(exe.trim_start_matches("C:\\").replace('\\', "/"))
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                exe
+            };
+            command.arg(host_exe).args(args);
+        } else {
+            command.arg("uninstaller");
+        }
+    } else {
+        command.arg("uninstaller");
+    }
+    command
+        .spawn()
+        .map_err(|error| format!("Wine kaldırma penceresi açılamadı: {error}"))?;
+    Ok(())
+}
+
 fn uninstall_windows_app_blocking(app: AppHandle, id: i64) -> Result<(), String> {
     let game = database::get_game_by_id(id)?;
     let Some(prefix_path) = game.prefix_path.clone() else {
@@ -1970,6 +2433,22 @@ fn uninstall_windows_app_blocking(app: AppHandle, id: i64) -> Result<(), String>
         .cloned()
         .or_else(|| Some(game.installer_path.clone()))
         .unwrap_or_default();
+    if !target_is_inside_wine_prefix(&target, &prefix_path) {
+        return Err(
+            "Bu taşınabilir uygulama Wine prefix içine kurulu değil; kütüphaneden kaldırılmalı"
+                .into(),
+        );
+    }
+    // If the Windows executable is already gone (for example after a failed
+    // Brave updater/uninstaller), this is an orphaned library record. Do not
+    // launch a stale registry command; remove only the ArDali record and the
+    // isolated prefix metadata.
+    if !Path::new(&target).exists() {
+        let _ = fs::remove_dir_all(&prefix_path);
+        database::remove_game(id, false)?;
+        let _ = app.publish_event(ArdaliEvent::LibraryChanged { id: Some(id) });
+        return Ok(());
+    }
     let wine = wine_executable()?;
     stop_wine_processes(&app, &wine, &prefix_path);
 
@@ -1979,10 +2458,43 @@ fn uninstall_windows_app_blocking(app: AppHandle, id: i64) -> Result<(), String>
             "info",
             &format!("Windows kaldırıcı başlatılıyor: {uninstall_string}"),
         )?;
+        let (mut uninstaller, mut arguments) = split_windows_command_line(&uninstall_string)
+            .ok_or_else(|| "Windows kaldırıcı komutu çözümlenemedi".to_string())?;
+        if uninstaller.to_ascii_lowercase().contains("brave")
+            || uninstall_string.to_ascii_lowercase().contains("brave")
+        {
+            if !arguments.iter().any(|arg| arg == "--force-uninstall") {
+                arguments.push("--force-uninstall".into());
+            }
+        }
+        // Brave updates its versioned Application directory, leaving an old
+        // registry uninstall path behind. Resolve that stale path to the
+        // current InstallShield/Brave setup executable before launching it.
+        let uninstaller_host = Path::new(&prefix_path)
+            .join("drive_c")
+            .join(uninstaller.trim_start_matches("C:\\").replace('\\', "/"));
+        if !uninstaller_host.exists() && uninstaller.to_ascii_lowercase().contains("brave") {
+            if let Some(current) = find_brave_uninstaller(&prefix_path) {
+                if let Some(windows_path) = host_path_to_windows_path(&prefix_path, &current) {
+                    uninstaller = windows_path;
+                }
+            }
+        }
+        let uninstaller_arg = if uninstaller.to_ascii_lowercase().starts_with("c:\\") {
+            Path::new(&prefix_path)
+                .join("drive_c")
+                .join(uninstaller.trim_start_matches("C:\\").replace('\\', "/"))
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            uninstaller
+        };
         let status = Command::new(&wine)
-            .args(["cmd", "/c", &uninstall_string])
+            .arg(uninstaller_arg)
+            .args(arguments)
             .env("WINEPREFIX", &prefix_path)
             .env("WINEARCH", "win64")
+            .env("WINEDEBUG", "-all")
             .current_dir(Path::new(&prefix_path).join("drive_c"))
             .status()
             .map_err(|error| format!("Windows kaldırıcı başlatılamadı: {error}"))?;
@@ -1990,10 +2502,22 @@ fn uninstall_windows_app_blocking(app: AppHandle, id: i64) -> Result<(), String>
             runtime::emit_backend_log(
                 &app,
                 "warn",
-                &format!("Windows kaldırıcı çıkış kodu başarılı değil: {status}"),
+                &format!("Windows kaldırıcı {status} döndürdü; Wine kaldırma penceresi açılıyor"),
             )?;
+            if game.name.to_ascii_lowercase().contains("brave") {
+                let _ = fs::remove_dir_all(&prefix_path);
+                database::remove_game(id, false)?;
+                let _ = app.publish_event(ArdaliEvent::LibraryChanged { id: Some(id) });
+                return Ok(());
+            }
+            return Err(format!("Windows kaldırıcı başarısız oldu: {status}"));
         }
     } else {
+        if !Path::new(&target).exists() {
+            database::remove_game(id, false)?;
+            let _ = app.publish_event(ArdaliEvent::LibraryChanged { id: Some(id) });
+            return Ok(());
+        }
         runtime::emit_backend_log(
             &app,
             "warn",
@@ -2008,18 +2532,152 @@ fn uninstall_windows_app_blocking(app: AppHandle, id: i64) -> Result<(), String>
     }
 
     wait_for_wine_processes(&app, &wine, &prefix_path);
-    if !target.trim().is_empty() && Path::new(&target).exists() {
-        return Err("Kaldırma tamamlanmadı Uygulama dosyası hala Wine içinde duruyor".into());
+    if Path::new(&target).exists() {
+        runtime::emit_backend_log(
+            &app,
+            "warn",
+            "Kaldırma sihirbazı tamamlandı ancak uygulama dosyası hâlâ mevcut; kayıt korunuyor",
+        )?;
+        if game.name.to_ascii_lowercase().contains("brave") {
+            let _ = fs::remove_dir_all(&prefix_path);
+            database::remove_game(id, false)?;
+            let _ = app.publish_event(ArdaliEvent::LibraryChanged { id: Some(id) });
+            return Ok(());
+        }
+        return Err("Kaldırma sihirbazı uygulama dosyasını silemedi".into());
     }
-
+    // Wine uninstallers may leave shared files or an EXE stub behind. A
+    // successful uninstaller is the source of truth; the library record must
+    // not remain visible merely because one path still exists.
     database::remove_game(id, false)?;
     runtime::emit_backend_log(
         &app,
         "info",
         &format!("{} Wine içinden kaldırıldı", game.name),
     )?;
-    let _ = app.emit("library-changed", id);
+    let _ = app.publish_event(ArdaliEvent::LibraryChanged { id: Some(id) });
     Ok(())
+}
+
+fn target_is_inside_wine_prefix(target: &str, prefix_path: &str) -> bool {
+    let target = Path::new(target);
+    let drive_c = Path::new(prefix_path).join("drive_c");
+    target.is_absolute() && target.starts_with(drive_c)
+}
+
+fn find_brave_uninstaller(prefix_path: &str) -> Option<String> {
+    let root = Path::new(prefix_path)
+        .join("drive_c/Program Files/BraveSoftware/Brave-Browser/Application");
+    let mut found = Vec::new();
+    collect_named_files(&root, "setup.exe", &mut found);
+    found
+        .into_iter()
+        .max_by_key(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn collect_named_files(root: &Path, name: &str, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_named_files(&path, name, found);
+        } else if path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| v.eq_ignore_ascii_case(name))
+        {
+            found.push(path);
+        }
+    }
+}
+
+fn split_windows_command_line(command: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+
+    for character in command.trim().chars() {
+        match character {
+            '"' => quoted = !quoted,
+            character if character.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    let executable = parts.first()?.clone();
+    Some((executable, parts.into_iter().skip(1).collect()))
+}
+
+#[cfg(test)]
+mod uninstall_command_tests {
+    use super::{
+        environment_matches_steam_app, has_installer_signature, split_windows_command_line,
+        wrap_with_gamemode, LaunchCommand,
+    };
+
+    #[test]
+    fn splits_quoted_installshield_command() {
+        let command = "\"C:\\Program Files (x86)\\Installer\\setup.exe\" -runfromtemp -removeonly";
+        let (executable, arguments) = split_windows_command_line(command).unwrap();
+        assert_eq!(executable, "C:\\Program Files (x86)\\Installer\\setup.exe");
+        assert_eq!(arguments, ["-runfromtemp", "-removeonly"]);
+    }
+
+    #[test]
+    fn rejects_unclosed_quotes() {
+        assert!(split_windows_command_line("\"C:\\broken.exe -remove").is_none());
+    }
+
+    #[test]
+    fn detects_ascii_and_utf16_installer_signatures() {
+        assert!(has_installer_signature(b"header InstallShield Wizard body"));
+        let utf16 = "Preparing to Install"
+            .bytes()
+            .flat_map(|byte| [byte, 0])
+            .collect::<Vec<_>>();
+        assert!(has_installer_signature(&utf16));
+        assert!(!has_installer_signature(b"Serious Sam game executable"));
+    }
+
+    #[test]
+    fn matches_only_the_requested_steam_app_process() {
+        let environment = b"PATH=/usr/bin\0SteamAppId=220\0SteamGameId=220\0";
+
+        assert!(environment_matches_steam_app(environment, "220"));
+        assert!(!environment_matches_steam_app(environment, "22"));
+        assert!(!environment_matches_steam_app(environment, "10"));
+    }
+
+    #[test]
+    fn wraps_any_runner_with_gamemoderun() {
+        let wrapped = wrap_with_gamemode(
+            LaunchCommand {
+                executable: "/usr/bin/steam".into(),
+                args: vec!["-applaunch".into(), "220".into()],
+            },
+            "/usr/bin/gamemoderun".into(),
+        );
+
+        assert_eq!(wrapped.executable, "/usr/bin/gamemoderun");
+        assert_eq!(wrapped.args, ["/usr/bin/steam", "-applaunch", "220"]);
+    }
 }
 
 fn find_uninstall_string(prefix_path: &str, game: &GameRecord, target: &str) -> Option<String> {
@@ -2162,6 +2820,9 @@ fn extract_windows_icon_for_record(app: &AppHandle, record: &GameRecord) {
         );
         return;
     }
+    let _ = app.publish_event(ArdaliEvent::LibraryChanged {
+        id: Some(record.id),
+    });
     let _ = runtime::emit_backend_log(
         app,
         "info",
@@ -2482,6 +3143,33 @@ fn update_game_mode(id: i64, options: GameModeOptions) -> Result<GameRecord, Str
 
 #[tauri::command]
 fn clear_game_session(app: AppHandle, id: i64) -> Result<GameRecord, String> {
+    let source = database::get_game_by_id(id)?;
+    if source.game_kind == "steam" {
+        if let Some(app_id) = steam_app_id(&source) {
+            if steam_app_process_running(&app_id) {
+                let handle = app.clone();
+                let name = source.name.clone();
+                thread::spawn(move || {
+                    let mut missing = 0_u8;
+                    while missing < 3 {
+                        if steam_app_process_running(&app_id) {
+                            missing = 0;
+                        } else {
+                            missing = missing.saturating_add(1);
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    let _ = database::finish_play_session(id);
+                    let _ = handle.publish_event(ArdaliEvent::GameEnded(GameProcessEvent {
+                        id,
+                        name,
+                        status: "Recovered Steam game process ended".into(),
+                    }));
+                });
+                return Ok(source);
+            }
+        }
+    }
     let game = database::clear_play_session(id)?;
     runtime::emit_backend_log(
         &app,
@@ -2499,7 +3187,7 @@ fn update_game_settings(
 ) -> Result<GameRecord, String> {
     let game = database::update_game_settings(id, &settings)?;
     apply_windows_version(&app, &game)?;
-    let _ = app.emit("library-changed", &game);
+    let _ = app.publish_event(ArdaliEvent::LibraryChanged { id: Some(game.id) });
     Ok(game)
 }
 
@@ -2627,20 +3315,34 @@ fn scan_steam() -> Result<SteamScan, String> {
 }
 
 #[tauri::command]
+fn steam_compatibility_status(app_id: String) -> Result<SteamCompatibilityStatus, String> {
+    steam::compatibility_status(&app_id)
+}
+
+#[tauri::command]
+fn set_steam_compatibility_tool(
+    app_id: String,
+    tool_name: Option<String>,
+) -> Result<SteamCompatibilityUpdate, String> {
+    steam::set_compatibility_tool(&app_id, tool_name.as_deref())
+}
+
+#[tauri::command]
 fn sync_steam_library(app: AppHandle) -> Result<Vec<GameRecord>, String> {
     database::initialize()?;
     let scan = steam::scan()?;
-    let proton = steam::preferred_proton(&scan);
+    let launcher = steam::launcher(&scan);
     let mut records = Vec::new();
+    database::reconcile_steam_games(&scan.games)?;
 
-    for game in &scan.games {
-        records.push(database::upsert_steam_game(game, proton.as_deref())?);
+    for game in scan.games.iter().filter(|game| game.installed) {
+        records.push(database::upsert_steam_game(game, launcher.as_ref())?);
     }
 
     runtime::emit_backend_log(
         &app,
         "info",
-        &format!("Steam sync completed: {} games.", records.len()),
+        &format!("Steam sync completed: {} installed games.", records.len()),
     )?;
     Ok(records)
 }
@@ -2688,6 +3390,7 @@ pub fn run() {
             pick_folder,
             windows_file_preview,
             fullscreen_tool_status,
+            test_gamemode,
             install_kdotool,
             install_gamescope,
             remove_gamescope,
@@ -2698,6 +3401,7 @@ pub fn run() {
             remove_game,
             refresh_windows_app_icon,
             uninstall_windows_app,
+            open_wine_uninstaller,
             game_settings,
             open_game_settings_window,
             update_game_mode,
@@ -2717,6 +3421,8 @@ pub fn run() {
             append_compatibility_error,
             fetch_protondb_summary,
             scan_steam,
+            steam_compatibility_status,
+            set_steam_compatibility_tool,
             sync_steam_library
         ])
         .run(tauri::generate_context!())

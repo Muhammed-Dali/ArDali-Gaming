@@ -1,8 +1,13 @@
-use crate::runtime::{self, GameKind, RunnerSelection};
+use crate::runtime::{self, GameKind, RunnerKind, RunnerSelection};
 use crate::steam::SteamGame;
-use rusqlite::{params, Connection};
+pub use ardali_core::{DisplayMode, LibraryType, PrefixMode};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 struct GameDefaults {
     windows_version: &'static str,
@@ -26,33 +31,6 @@ pub struct GameInstallRequest {
     pub prefix_mode: Option<PrefixMode>,
     pub installer_path: String,
     pub install_dir: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PrefixMode {
-    Isolated,
-    SharedWindowsApps,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LibraryType {
-    Game,
-    WindowsApp,
-    Tool,
-    Installer,
-}
-
-impl LibraryType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Game => "game",
-            Self::WindowsApp => "windows-app",
-            Self::Tool => "tool",
-            Self::Installer => "installer",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +68,9 @@ pub struct GameRecord {
     pub ddraw_override: bool,
     pub windows_version: String,
     pub cncnet_installed: bool,
+    pub gamemode_enabled: bool,
+    pub steam_launch_options: String,
+    pub source_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,21 +80,14 @@ pub struct AppSetting {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DisplayMode {
-    Windowed,
-    Fullscreen,
-}
-
-impl DisplayMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Windowed => "windowed",
-            Self::Fullscreen => "fullscreen",
-        }
-    }
-}
+const ALLOWED_SETTING_KEYS: &[&str] = &[
+    "default_display_mode",
+    "library_runner_filter",
+    "fps_overlay",
+    "auto_sync_steam",
+    "steamgriddb_api_key",
+];
+const SENSITIVE_SETTING_KEYS: &[&str] = &["steamgriddb_api_key"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -137,121 +111,12 @@ pub struct GameSettingsUpdate {
     pub protondb_note: Option<String>,
     pub ddraw_override: bool,
     pub windows_version: String,
+    pub gamemode_enabled: bool,
+    pub steam_launch_options: String,
 }
 
 pub fn initialize() -> Result<(), String> {
-    let connection = connection()?;
-    connection
-        .execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS games (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              game_id TEXT NOT NULL UNIQUE,
-              name TEXT NOT NULL,
-              game_kind TEXT NOT NULL,
-              runner TEXT NOT NULL,
-              installer_path TEXT NOT NULL,
-              install_dir TEXT NOT NULL,
-              prefix_path TEXT,
-              executable TEXT,
-              arguments_json TEXT NOT NULL,
-              created_at INTEGER NOT NULL DEFAULT (unixepoch())
-            );
-            CREATE TABLE IF NOT EXISTS play_sessions (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              game_id INTEGER NOT NULL,
-              started_at INTEGER NOT NULL DEFAULT (unixepoch()),
-              ended_at INTEGER,
-              duration_seconds INTEGER,
-              FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL,
-              updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-            );
-            CREATE TABLE IF NOT EXISTS game_metadata (
-              game_id INTEGER PRIMARY KEY,
-              cover_path TEXT,
-              title TEXT,
-              genre TEXT,
-              release_year INTEGER,
-              description TEXT,
-              source TEXT,
-              updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-              FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
-            );
-            ",
-        )
-        .map_err(|error| format!("Cannot initialize SQLite database: {error}"))?;
-
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN last_played_at INTEGER",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN display_mode TEXT NOT NULL DEFAULT 'windowed'",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN fps_overlay INTEGER NOT NULL DEFAULT 0",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN total_playtime_seconds INTEGER NOT NULL DEFAULT 0",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN active_session_id INTEGER",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN preferred_runner TEXT NOT NULL DEFAULT ''",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN dxvk_enabled INTEGER NOT NULL DEFAULT 1",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN dll_override TEXT",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN virtual_desktop INTEGER NOT NULL DEFAULT 1",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN gamescope_enabled INTEGER NOT NULL DEFAULT 0",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN resolution TEXT NOT NULL DEFAULT 'auto'",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN gamescope_scaler TEXT NOT NULL DEFAULT 'fit'",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN protondb_note TEXT",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN ddraw_override INTEGER NOT NULL DEFAULT 1",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN windows_version TEXT NOT NULL DEFAULT ''",
-    )?;
-    migrate_column(
-        &connection,
-        "ALTER TABLE games ADD COLUMN library_type TEXT NOT NULL DEFAULT 'game'",
-    )?;
-    seed_default_settings(&connection)?;
-
-    Ok(())
+    ardali_storage::initialize(database_path()?).map_err(|error| error.to_string())
 }
 
 pub fn add_game(
@@ -310,52 +175,38 @@ pub fn add_game(
         .filter(|runner| {
             matches!(
                 *runner,
-                "wine" | "proton" | "steam-proton" | "openra" | "dosbox-x" | "cncnet"
+                "wine" | "steam" | "proton" | "openra" | "dosbox-x" | "cncnet"
             )
         })
         .unwrap_or(detected_runner);
     let connection = connection()?;
-    connection
-        .execute(
-            "
-            INSERT INTO games (
-              game_id, name, game_kind, runner, installer_path, install_dir,
-              prefix_path, executable, arguments_json, preferred_runner, dxvk_enabled,
-              virtual_desktop, gamescope_enabled, resolution, gamescope_scaler,
-              ddraw_override, windows_version, dll_override, library_type
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-            ",
-            params![
-                game_id,
-                request.name,
-                request.game_kind.as_str(),
-                detected_runner,
-                request.installer_path,
-                install_dir,
-                prefix_path,
-                selection.executable,
-                arguments_json,
-                preferred_runner,
-                defaults.dxvk_enabled as i64,
-                defaults.virtual_desktop as i64,
-                defaults.gamescope_enabled as i64,
-                defaults.resolution,
-                defaults.gamescope_scaler,
-                defaults.ddraw_override as i64,
-                defaults.windows_version,
-                defaults.dll_override,
-                library_type,
-            ],
-        )
-        .map_err(|error| format!("Cannot insert game record: {error}"))?;
-    let inserted_id = connection.last_insert_rowid();
-    connection
-        .execute(
-            "UPDATE games SET display_mode = ?2 WHERE id = ?1",
-            params![inserted_id, defaults.display_mode],
-        )
-        .map_err(|error| format!("Cannot apply default display mode: {error}"))?;
+    let inserted_id = ardali_storage::insert_game(
+        &connection,
+        &ardali_storage::NewGame {
+            game_id: &game_id,
+            name: &request.name,
+            game_kind: request.game_kind.as_str(),
+            runner: detected_runner,
+            installer_path: &request.installer_path,
+            install_dir: &install_dir,
+            prefix_path: prefix_path.as_deref(),
+            executable: selection.executable.as_deref(),
+            arguments_json: &arguments_json,
+            preferred_runner,
+            dxvk_enabled: defaults.dxvk_enabled,
+            virtual_desktop: defaults.virtual_desktop,
+            gamescope_enabled: defaults.gamescope_enabled,
+            resolution: defaults.resolution,
+            gamescope_scaler: defaults.gamescope_scaler,
+            ddraw_override: defaults.ddraw_override,
+            windows_version: defaults.windows_version,
+            dll_override: defaults.dll_override,
+            library_type,
+            display_mode: defaults.display_mode,
+            gamemode_enabled: false,
+        },
+    )
+    .map_err(|error| error.to_string())?;
 
     get_game(inserted_id)
 }
@@ -363,181 +214,159 @@ pub fn add_game(
 pub fn list_games() -> Result<Vec<GameRecord>, String> {
     initialize()?;
     let connection = connection()?;
-    let mut statement = connection
-        .prepare(
-            "
-            SELECT g.id, g.game_id, g.name, g.game_kind, g.runner, g.installer_path, g.install_dir,
-                   g.prefix_path, g.executable, g.arguments_json, g.created_at, g.last_played_at,
-                   g.display_mode, g.fps_overlay, g.total_playtime_seconds, g.active_session_id,
-                   m.cover_path, m.genre, m.release_year, m.description, g.preferred_runner,
-                   g.dxvk_enabled, g.dll_override, g.virtual_desktop, g.gamescope_enabled, g.resolution,
-                   g.protondb_note, g.ddraw_override, g.windows_version, g.gamescope_scaler, g.library_type
-            FROM games g
-            LEFT JOIN game_metadata m ON m.game_id = g.id
-            ORDER BY g.created_at DESC, g.id DESC
-            ",
-        )
-        .map_err(|error| format!("Cannot prepare game list query: {error}"))?;
-
-    let rows = statement
-        .query_map([], row_to_game)
-        .map_err(|error| format!("Cannot query games: {error}"))?;
-
-    let mut games = Vec::new();
-    for row in rows {
-        games.push(row.map_err(|error| format!("Cannot read game record: {error}"))?);
-    }
-    Ok(games)
+    ardali_storage::list_games(&connection)
+        .map(|games| games.into_iter().map(stored_game_to_record).collect())
+        .map_err(|error| error.to_string())
 }
 
 pub fn upsert_steam_game(
     game: &SteamGame,
-    proton_path: Option<&str>,
+    launcher: Option<&crate::steam::SteamLauncher>,
 ) -> Result<GameRecord, String> {
     initialize()?;
     let game_id = crate::steam::steam_game_id(&game.app_id);
-    let executable = proton_path.map(ToString::to_string);
-    let arguments_json = serde_json::to_string(&vec![game.install_dir.clone()])
+    let executable = launcher.map(|launcher| launcher.executable.clone());
+    let arguments = launcher
+        .map(|launcher| crate::steam::launch_arguments(launcher, &game.app_id))
+        .unwrap_or_else(|| vec!["-applaunch".into(), game.app_id.clone()]);
+    let arguments_json = serde_json::to_string(&arguments)
         .map_err(|error| format!("Cannot serialize Steam launch arguments: {error}"))?;
     let connection = connection()?;
 
-    connection
-        .execute(
-            "
-            INSERT INTO games (
-              game_id, name, game_kind, runner, installer_path, install_dir,
-              prefix_path, executable, arguments_json, library_type
-            )
-            VALUES (?1, ?2, 'steam', 'steam-proton', ?3, ?4, NULL, ?5, ?6, 'game')
-            ON CONFLICT(game_id) DO UPDATE SET
-              name = excluded.name,
-              runner = excluded.runner,
-              installer_path = excluded.installer_path,
-              install_dir = excluded.install_dir,
-              executable = excluded.executable,
-              arguments_json = excluded.arguments_json
-            ",
-            params![
-                game_id,
-                game.name,
-                game.manifest_path,
-                game.install_dir,
-                executable,
-                arguments_json
-            ],
-        )
-        .map_err(|error| format!("Cannot sync Steam game record: {error}"))?;
+    ardali_storage::upsert_game(
+        &connection,
+        &ardali_storage::NewGame {
+            game_id: &game_id,
+            name: &game.name,
+            game_kind: GameKind::Steam.as_str(),
+            runner: RunnerKind::Steam.as_str(),
+            installer_path: &game.manifest_path,
+            install_dir: &game.install_dir,
+            prefix_path: None,
+            executable: executable.as_deref(),
+            arguments_json: &arguments_json,
+            preferred_runner: RunnerKind::Steam.as_str(),
+            dxvk_enabled: true,
+            virtual_desktop: false,
+            gamescope_enabled: false,
+            resolution: "auto",
+            gamescope_scaler: "fit",
+            ddraw_override: false,
+            windows_version: "",
+            dll_override: None,
+            library_type: LibraryType::Game.as_str(),
+            display_mode: DisplayMode::Windowed.as_str(),
+            gamemode_enabled: false,
+        },
+    )
+    .map_err(|error| error.to_string())?;
 
-    get_game_by_game_id(&game_id)
+    let record = get_game_by_game_id(&game_id)?;
+    if record.cover_path.is_none() {
+        if let Some(cover_path) = game.cover_path.as_deref() {
+            ardali_storage::save_metadata(
+                &connection,
+                record.id,
+                Some(cover_path),
+                None,
+                None,
+                None,
+                None,
+                "steam-local",
+            )
+            .map_err(|error| error.to_string())?;
+            return get_game_by_game_id(&game_id);
+        }
+    }
+    Ok(record)
+}
+
+pub fn reconcile_steam_games(games: &[SteamGame]) -> Result<(), String> {
+    initialize()?;
+    let available = games
+        .iter()
+        .filter(|game| game.installed)
+        .map(|game| crate::steam::steam_game_id(&game.app_id))
+        .collect::<Vec<_>>();
+    let mut connection = connection()?;
+    ardali_storage::reconcile_steam_games(&mut connection, &available)
+        .map_err(|error| error.to_string())
 }
 
 fn get_game(id: i64) -> Result<GameRecord, String> {
     let connection = connection()?;
-    connection
-        .query_row(
-            "
-            SELECT g.id, g.game_id, g.name, g.game_kind, g.runner, g.installer_path, g.install_dir,
-                   g.prefix_path, g.executable, g.arguments_json, g.created_at, g.last_played_at,
-                   g.display_mode, g.fps_overlay, g.total_playtime_seconds, g.active_session_id,
-                   m.cover_path, m.genre, m.release_year, m.description, g.preferred_runner,
-                   g.dxvk_enabled, g.dll_override, g.virtual_desktop, g.gamescope_enabled, g.resolution,
-                   g.protondb_note, g.ddraw_override, g.windows_version, g.gamescope_scaler, g.library_type
-            FROM games g
-            LEFT JOIN game_metadata m ON m.game_id = g.id
-            WHERE g.id = ?1
-            ",
-            params![id],
-            row_to_game,
-        )
-        .map_err(|error| format!("Cannot read inserted game record: {error}"))
+    ardali_storage::get_game(&connection, id)
+        .map(stored_game_to_record)
+        .map_err(|error| error.to_string())
 }
 
 fn get_game_by_game_id(game_id: &str) -> Result<GameRecord, String> {
     let connection = connection()?;
-    connection
-        .query_row(
-            "
-            SELECT g.id, g.game_id, g.name, g.game_kind, g.runner, g.installer_path, g.install_dir,
-                   g.prefix_path, g.executable, g.arguments_json, g.created_at, g.last_played_at,
-                   g.display_mode, g.fps_overlay, g.total_playtime_seconds, g.active_session_id,
-                   m.cover_path, m.genre, m.release_year, m.description, g.preferred_runner,
-                   g.dxvk_enabled, g.dll_override, g.virtual_desktop, g.gamescope_enabled, g.resolution,
-                   g.protondb_note, g.ddraw_override, g.windows_version, g.gamescope_scaler, g.library_type
-            FROM games g
-            LEFT JOIN game_metadata m ON m.game_id = g.id
-            WHERE g.game_id = ?1
-            ",
-            params![game_id],
-            row_to_game,
-        )
-        .map_err(|error| format!("Cannot read synced Steam game record: {error}"))
+    ardali_storage::get_game_by_game_id(&connection, game_id)
+        .map(stored_game_to_record)
+        .map_err(|error| error.to_string())
 }
 
-fn row_to_game(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameRecord> {
-    let arguments_json: String = row.get(9)?;
+fn stored_game_to_record(game: ardali_storage::StoredGame) -> GameRecord {
+    let arguments_json = game.arguments_json;
     let arguments: Vec<String> = serde_json::from_str(&arguments_json).unwrap_or_default();
-    let install_dir: String = row.get(6)?;
-    let name: String = row.get(2)?;
-    let library_type = row
-        .get::<_, String>(30)
-        .ok()
+    let install_dir = game.install_dir;
+    let name = game.name;
+    let library_type = Some(game.library_type)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "game".into());
-    let manual_cover_path: Option<String> = row.get::<_, Option<String>>(16)?;
+    let manual_cover_path = game.cover_path;
     let cover_path = if library_type == "windows-app" || library_type == "tool" {
         manual_cover_path
     } else {
         manual_cover_path.or_else(|| local_cover_path(&install_dir, &arguments))
     };
-    let windows_version = row
-        .get::<_, String>(28)
-        .ok()
+    let windows_version = Some(game.windows_version)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| recommended_windows_version(&name, &install_dir, &arguments));
     let cncnet_installed = cncnet_client_path(&install_dir).exists();
 
-    Ok(GameRecord {
-        id: row.get(0)?,
-        game_id: row.get(1)?,
+    GameRecord {
+        id: game.id,
+        game_id: game.game_id,
         name: name.clone(),
-        game_kind: row.get(3)?,
+        game_kind: game.game_kind,
         library_type,
-        runner: row.get(4)?,
-        installer_path: row.get(5)?,
+        runner: game.runner.clone(),
+        installer_path: game.installer_path,
         install_dir,
-        prefix_path: row.get(7)?,
-        executable: row.get(8)?,
+        prefix_path: game.prefix_path,
+        executable: game.executable,
         arguments,
-        created_at: row.get(10)?,
-        last_played_at: row.get(11)?,
-        display_mode: row.get(12)?,
-        fps_overlay: row.get::<_, i64>(13)? == 1,
-        total_playtime_seconds: row.get(14)?,
-        active_session_id: row.get(15)?,
+        created_at: game.created_at,
+        last_played_at: game.last_played_at,
+        display_mode: game.display_mode,
+        fps_overlay: game.fps_overlay,
+        total_playtime_seconds: game.total_playtime_seconds,
+        active_session_id: game.active_session_id,
         cover_path,
-        genre: row.get(17)?,
-        release_year: row.get(18)?,
-        description: row.get(19)?,
-        preferred_runner: row
-            .get::<_, String>(20)
-            .ok()
+        genre: game.genre,
+        release_year: game.release_year,
+        description: game.description,
+        preferred_runner: Some(game.preferred_runner)
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| row.get::<_, String>(4).unwrap_or_else(|_| "wine".into())),
-        dxvk_enabled: row.get::<_, i64>(21)? == 1,
-        dll_override: row.get(22)?,
-        virtual_desktop: row.get::<_, i64>(23)? == 1,
-        gamescope_enabled: row.get::<_, i64>(24)? == 1,
-        resolution: row.get(25)?,
-        gamescope_scaler: row
-            .get::<_, String>(29)
-            .ok()
+            .unwrap_or(game.runner),
+        dxvk_enabled: game.dxvk_enabled,
+        dll_override: game.dll_override,
+        virtual_desktop: game.virtual_desktop,
+        gamescope_enabled: game.gamescope_enabled,
+        resolution: game.resolution,
+        gamescope_scaler: Some(game.gamescope_scaler)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "fit".into()),
-        protondb_note: row.get(26)?,
-        ddraw_override: row.get::<_, i64>(27)? == 1,
+        protondb_note: game.protondb_note,
+        ddraw_override: game.ddraw_override,
         windows_version,
         cncnet_installed,
-    })
+        gamemode_enabled: game.gamemode_enabled,
+        steam_launch_options: game.steam_launch_options,
+        source_available: game.source_available,
+    }
 }
 
 pub fn cncnet_client_path(install_dir: &str) -> std::path::PathBuf {
@@ -799,37 +628,13 @@ pub fn get_game_by_id(id: i64) -> Result<GameRecord, String> {
 
 pub fn mark_game_launched(id: i64, options: &GameModeOptions) -> Result<GameRecord, String> {
     let connection = connection()?;
-    connection
-        .execute(
-            "UPDATE games SET active_session_id = NULL WHERE id = ?1 AND active_session_id IS NOT NULL",
-            params![id],
-        )
-        .map_err(|error| format!("Cannot reset stale play session: {error}"))?;
-    connection
-        .execute(
-            "INSERT INTO play_sessions (game_id) VALUES (?1)",
-            params![id],
-        )
-        .map_err(|error| format!("Cannot create play session: {error}"))?;
-    let session_id = connection.last_insert_rowid();
-    connection
-        .execute(
-            "
-            UPDATE games
-            SET last_played_at = unixepoch(),
-                display_mode = ?2,
-                fps_overlay = ?3,
-                active_session_id = ?4
-            WHERE id = ?1
-            ",
-            params![
-                id,
-                options.display_mode.as_str(),
-                options.fps_overlay as i64,
-                session_id
-            ],
-        )
-        .map_err(|error| format!("Cannot update last played time: {error}"))?;
+    ardali_storage::start_play_session(
+        &connection,
+        id,
+        options.display_mode.as_str(),
+        options.fps_overlay,
+    )
+    .map_err(|error| error.to_string())?;
     get_game(id)
 }
 
@@ -840,30 +645,8 @@ pub fn finish_play_session(id: i64) -> Result<GameRecord, String> {
     };
 
     let connection = connection()?;
-    connection
-        .execute(
-            "
-            UPDATE play_sessions
-            SET ended_at = unixepoch(),
-                duration_seconds = unixepoch() - started_at
-            WHERE id = ?1 AND ended_at IS NULL
-            ",
-            params![session_id],
-        )
-        .map_err(|error| format!("Cannot finish play session: {error}"))?;
-    connection
-        .execute(
-            "
-            UPDATE games
-            SET total_playtime_seconds = total_playtime_seconds + COALESCE((
-                  SELECT duration_seconds FROM play_sessions WHERE id = ?2
-                ), 0),
-                active_session_id = NULL
-            WHERE id = ?1
-            ",
-            params![id, session_id],
-        )
-        .map_err(|error| format!("Cannot update total playtime: {error}"))?;
+    ardali_storage::finish_play_session(&connection, id, session_id)
+        .map_err(|error| error.to_string())?;
     get_game(id)
 }
 
@@ -874,89 +657,150 @@ pub fn clear_play_session(id: i64) -> Result<GameRecord, String> {
     };
 
     let connection = connection()?;
-    connection
-        .execute(
-            "
-            UPDATE play_sessions
-            SET ended_at = unixepoch(),
-                duration_seconds = COALESCE(duration_seconds, unixepoch() - started_at)
-            WHERE id = ?1 AND ended_at IS NULL
-            ",
-            params![session_id],
-        )
-        .map_err(|error| format!("Cannot clear play session: {error}"))?;
-    connection
-        .execute(
-            "UPDATE games SET active_session_id = NULL WHERE id = ?1",
-            params![id],
-        )
-        .map_err(|error| format!("Cannot clear active play session: {error}"))?;
+    ardali_storage::clear_play_session(&connection, id, session_id)
+        .map_err(|error| error.to_string())?;
     get_game(id)
 }
 
 pub fn list_settings() -> Result<Vec<AppSetting>, String> {
     initialize()?;
     let connection = connection()?;
-    let mut statement = connection
-        .prepare("SELECT key, value FROM settings ORDER BY key")
-        .map_err(|error| format!("Cannot prepare settings query: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok(AppSetting {
-                key: row.get(0)?,
-                value: row.get(1)?,
-            })
+    let mut settings = ardali_storage::list_settings(&connection)
+        .map(|settings| {
+            settings
+                .into_iter()
+                .flat_map(public_settings)
+                .collect::<Vec<_>>()
         })
-        .map_err(|error| format!("Cannot query settings: {error}"))?;
-
-    let mut settings = Vec::new();
-    for row in rows {
-        settings.push(row.map_err(|error| format!("Cannot read setting: {error}"))?);
+        .map_err(|error| error.to_string())?;
+    if let Some(configured) = settings
+        .iter_mut()
+        .find(|setting| setting.key == "steamgriddb_api_key_configured")
+    {
+        configured.value = get_setting_value("steamgriddb_api_key")?
+            .is_some_and(|value| !value.trim().is_empty())
+            .to_string();
     }
     Ok(settings)
 }
 
 pub fn set_setting(key: String, value: String) -> Result<AppSetting, String> {
+    if !ALLOWED_SETTING_KEYS.contains(&key.as_str()) {
+        return Err(format!("Unsupported setting key: {key}"));
+    }
     initialize()?;
     let connection = connection()?;
-    connection
-        .execute(
-            "
-            INSERT INTO settings (key, value, updated_at)
-            VALUES (?1, ?2, unixepoch())
-            ON CONFLICT(key) DO UPDATE SET
-              value = excluded.value,
-              updated_at = excluded.updated_at
-            ",
-            params![key, value],
-        )
-        .map_err(|error| format!("Cannot write setting: {error}"))?;
+    if SENSITIVE_SETTING_KEYS.contains(&key.as_str()) && store_keyring_secret(&key, &value)? {
+        return ardali_storage::set_setting(&connection, &key, "")
+            .map(|setting| public_settings(setting).next().expect("setting response"))
+            .map_err(|error| error.to_string());
+    }
+    ardali_storage::set_setting(&connection, &key, &value)
+        .map(|setting| public_settings(setting).next().expect("setting response"))
+        .map_err(|error| error.to_string())
+}
 
-    let mut statement = connection
-        .prepare("SELECT key, value FROM settings WHERE key = ?1")
-        .map_err(|error| format!("Cannot prepare setting lookup: {error}"))?;
-    statement
-        .query_row(params![key], |row| {
-            Ok(AppSetting {
-                key: row.get(0)?,
-                value: row.get(1)?,
-            })
-        })
-        .map_err(|error| format!("Cannot read setting: {error}"))
+fn public_settings(setting: ardali_storage::StoredSetting) -> impl Iterator<Item = AppSetting> {
+    let sensitive = SENSITIVE_SETTING_KEYS.contains(&setting.key.as_str());
+    let configured = sensitive && !setting.value.trim().is_empty();
+    let mut settings = vec![AppSetting {
+        key: setting.key.clone(),
+        value: if sensitive {
+            String::new()
+        } else {
+            setting.value
+        },
+    }];
+    if sensitive {
+        settings.push(AppSetting {
+            key: format!("{}_configured", setting.key),
+            value: configured.to_string(),
+        });
+    }
+    settings.into_iter()
 }
 
 pub fn get_setting_value(key: &str) -> Result<Option<String>, String> {
     initialize()?;
-    let connection = connection()?;
-    match connection.query_row(
-        "SELECT value FROM settings WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    ) {
-        Ok(value) => Ok(Some(value)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(error) => Err(format!("Cannot read setting: {error}")),
+    if SENSITIVE_SETTING_KEYS.contains(&key) {
+        if let Some(secret) = lookup_keyring_secret(key)? {
+            return Ok(Some(secret));
+        }
     }
+    let connection = connection()?;
+    let value =
+        ardali_storage::get_setting_value(&connection, key).map_err(|error| error.to_string())?;
+    if SENSITIVE_SETTING_KEYS.contains(&key) {
+        if let Some(secret) = value.as_deref().filter(|value| !value.trim().is_empty()) {
+            if store_keyring_secret(key, secret)? {
+                ardali_storage::set_setting(&connection, key, "")
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn secret_tool() -> Option<PathBuf> {
+    env::var_os("PATH")?
+        .to_string_lossy()
+        .split(':')
+        .map(|directory| Path::new(directory).join("secret-tool"))
+        .find(|path| path.is_file())
+}
+
+fn lookup_keyring_secret(key: &str) -> Result<Option<String>, String> {
+    let Some(tool) = secret_tool() else {
+        return Ok(None);
+    };
+    let output = Command::new(tool)
+        .args(["lookup", "service", "ardali-gaming", "key", key])
+        .output()
+        .map_err(|error| format!("Secret Service okunamadı: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+fn store_keyring_secret(key: &str, value: &str) -> Result<bool, String> {
+    let Some(tool) = secret_tool() else {
+        return Ok(false);
+    };
+    if value.is_empty() {
+        let _ = Command::new(tool)
+            .args(["clear", "service", "ardali-gaming", "key", key])
+            .status();
+        return Ok(true);
+    }
+    let mut child = Command::new(tool)
+        .args([
+            "store",
+            "--label",
+            "ArDali Gaming",
+            "service",
+            "ardali-gaming",
+            "key",
+            key,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Secret Service başlatılamadı: {error}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "Secret Service girişi açılamadı".to_string())?
+        .write_all(value.as_bytes())
+        .map_err(|error| format!("Secret Service yazılamadı: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Secret Service beklenemedi: {error}"))?;
+    Ok(output.status.success())
 }
 
 pub fn save_metadata(
@@ -970,115 +814,69 @@ pub fn save_metadata(
 ) -> Result<GameRecord, String> {
     initialize()?;
     let connection = connection()?;
-    connection
-        .execute(
-            "
-            INSERT INTO game_metadata (
-              game_id, cover_path, title, genre, release_year, description, source, updated_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch())
-            ON CONFLICT(game_id) DO UPDATE SET
-              cover_path = COALESCE(excluded.cover_path, game_metadata.cover_path),
-              title = COALESCE(excluded.title, game_metadata.title),
-              genre = COALESCE(excluded.genre, game_metadata.genre),
-              release_year = COALESCE(excluded.release_year, game_metadata.release_year),
-              description = COALESCE(excluded.description, game_metadata.description),
-              source = excluded.source,
-              updated_at = excluded.updated_at
-            ",
-            params![
-                id,
-                cover_path,
-                title,
-                genre,
-                release_year,
-                description,
-                source
-            ],
-        )
-        .map_err(|error| format!("Cannot save game metadata: {error}"))?;
+    ardali_storage::save_metadata(
+        &connection,
+        id,
+        cover_path.as_deref(),
+        title.as_deref(),
+        genre.as_deref(),
+        release_year,
+        description.as_deref(),
+        &source,
+    )
+    .map_err(|error| error.to_string())?;
     get_game(id)
 }
 
 pub fn update_game_mode(id: i64, options: &GameModeOptions) -> Result<GameRecord, String> {
     let connection = connection()?;
-    connection
-        .execute(
-            "UPDATE games SET display_mode = ?2, fps_overlay = ?3 WHERE id = ?1",
-            params![
-                id,
-                options.display_mode.as_str(),
-                options.fps_overlay as i64
-            ],
-        )
-        .map_err(|error| format!("Cannot update game mode options: {error}"))?;
+    ardali_storage::update_game_mode(
+        &connection,
+        id,
+        options.display_mode.as_str(),
+        options.fps_overlay,
+    )
+    .map_err(|error| error.to_string())?;
     get_game(id)
 }
 
 pub fn update_game_settings(id: i64, settings: &GameSettingsUpdate) -> Result<GameRecord, String> {
     let connection = connection()?;
     let dxvk_enabled = settings.dxvk_enabled && !settings.ddraw_override;
-    connection
-        .execute(
-            "
-            UPDATE games
-            SET preferred_runner = ?2,
-                dxvk_enabled = ?3,
-                dll_override = NULLIF(?4, ''),
-                display_mode = ?5,
-                virtual_desktop = ?6,
-                gamescope_enabled = ?7,
-                resolution = ?8,
-                protondb_note = NULLIF(?9, ''),
-                ddraw_override = ?10,
-                windows_version = ?11,
-                game_kind = ?12,
-                gamescope_scaler = ?13
-            WHERE id = ?1
-            ",
-            params![
-                id,
-                settings.preferred_runner.trim(),
-                dxvk_enabled as i64,
-                settings.dll_override.clone().unwrap_or_default().trim(),
-                settings.display_mode.as_str(),
-                settings.virtual_desktop as i64,
-                settings.gamescope_enabled as i64,
-                settings.resolution.trim(),
-                settings.protondb_note.clone().unwrap_or_default().trim(),
-                settings.ddraw_override as i64,
-                settings.windows_version.trim(),
-                settings.game_kind.as_str(),
-                normalized_gamescope_scaler(&settings.gamescope_scaler),
-            ],
-        )
-        .map_err(|error| format!("Cannot update game settings: {error}"))?;
+    ardali_storage::update_game_settings(
+        &connection,
+        id,
+        &ardali_storage::GameSettings {
+            preferred_runner: settings.preferred_runner.trim(),
+            dxvk_enabled,
+            dll_override: settings.dll_override.as_deref().map(str::trim),
+            display_mode: settings.display_mode.as_str(),
+            virtual_desktop: settings.virtual_desktop,
+            gamescope_enabled: settings.gamescope_enabled,
+            resolution: settings.resolution.trim(),
+            protondb_note: settings.protondb_note.as_deref().map(str::trim),
+            ddraw_override: settings.ddraw_override,
+            windows_version: settings.windows_version.trim(),
+            game_kind: settings.game_kind.as_str(),
+            gamescope_scaler: normalized_gamescope_scaler(&settings.gamescope_scaler),
+            gamemode_enabled: settings.gamemode_enabled,
+            steam_launch_options: settings.steam_launch_options.trim(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
     get_game(id)
 }
 
 pub fn mark_cncnet_installed(id: i64) -> Result<GameRecord, String> {
     let connection = connection()?;
-    connection
-        .execute(
-            "
-            UPDATE games
-            SET runner = 'cncnet',
-                preferred_runner = 'cncnet',
-                game_kind = 'cncnet'
-            WHERE id = ?1
-            ",
-            params![id],
-        )
-        .map_err(|error| format!("Cannot update CnCNet runner: {error}"))?;
+    ardali_storage::mark_cncnet_installed(&connection, id).map_err(|error| error.to_string())?;
     get_game(id)
 }
 
 pub fn remove_game(id: i64, remove_files: bool) -> Result<(), String> {
     let game = get_game(id)?;
     let connection = connection()?;
-    connection
-        .execute("DELETE FROM games WHERE id = ?1", params![id])
-        .map_err(|error| format!("Cannot remove game record: {error}"))?;
+    ardali_storage::delete_game(&connection, id).map_err(|error| error.to_string())?;
 
     if remove_files {
         let install_dir = Path::new(&game.install_dir);
@@ -1091,46 +889,12 @@ pub fn remove_game(id: i64, remove_files: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn connection() -> Result<Connection, String> {
-    let paths = runtime::runtime_paths()?;
-    if let Some(parent) = Path::new(&paths.database_path).parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Cannot create database directory: {error}"))?;
-    }
-    Connection::open(paths.database_path)
-        .map_err(|error| format!("Cannot open SQLite database: {error}"))
+fn connection() -> Result<ardali_storage::StorageConnection, String> {
+    ardali_storage::open(database_path()?).map_err(|error| error.to_string())
 }
 
-fn migrate_column(connection: &Connection, sql: &str) -> Result<(), String> {
-    connection
-        .execute(sql, [])
-        .or_else(|error| {
-            if error.to_string().contains("duplicate column name") {
-                Ok(0)
-            } else {
-                Err(error)
-            }
-        })
-        .map(|_| ())
-        .map_err(|error| format!("Cannot migrate SQLite database: {error}"))
-}
-
-fn seed_default_settings(connection: &Connection) -> Result<(), String> {
-    for (key, value) in [
-        ("default_display_mode", "windowed"),
-        ("library_runner_filter", "all"),
-        ("fps_overlay", "false"),
-        ("auto_sync_steam", "false"),
-        ("steamgriddb_api_key", ""),
-    ] {
-        connection
-            .execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
-                params![key, value],
-            )
-            .map_err(|error| format!("Cannot seed default setting: {error}"))?;
-    }
-    Ok(())
+fn database_path() -> Result<String, String> {
+    runtime::runtime_paths().map(|paths| paths.database_path)
 }
 
 fn unique_game_id(name: &str) -> Result<String, String> {
@@ -1144,19 +908,46 @@ fn unique_game_id(name: &str) -> Result<String, String> {
     let mut suffix = 2;
 
     loop {
-        let count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM games WHERE game_id = ?1",
-                params![candidate],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Cannot check game id: {error}"))?;
-
-        if count == 0 {
+        if !ardali_storage::game_id_exists(&connection, &candidate)
+            .map_err(|error| error.to_string())?
+        {
             return Ok(candidate);
         }
 
         candidate = format!("{base}-{suffix}");
         suffix += 1;
+    }
+}
+
+#[cfg(test)]
+mod setting_security_tests {
+    use super::public_settings;
+    use ardali_storage::StoredSetting;
+
+    #[test]
+    fn redacts_sensitive_settings_and_reports_configuration_state() {
+        let settings = public_settings(StoredSetting {
+            key: "steamgriddb_api_key".into(),
+            value: "secret-value".into(),
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(settings.len(), 2);
+        assert_eq!(settings[0].key, "steamgriddb_api_key");
+        assert!(settings[0].value.is_empty());
+        assert_eq!(settings[1].key, "steamgriddb_api_key_configured");
+        assert_eq!(settings[1].value, "true");
+    }
+
+    #[test]
+    fn keeps_non_sensitive_settings_visible() {
+        let settings = public_settings(StoredSetting {
+            key: "fps_overlay".into(),
+            value: "true".into(),
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(settings.len(), 1);
+        assert_eq!(settings[0].value, "true");
     }
 }

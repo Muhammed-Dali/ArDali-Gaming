@@ -1,0 +1,11 @@
+[package]
+name = "ardali-storage"
+version = "0.2.0"
+description = "UI-independent SQLite storage for ArDali Gaming"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+
+[dependencies]
+ardali-core = { path = "../ardali-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }

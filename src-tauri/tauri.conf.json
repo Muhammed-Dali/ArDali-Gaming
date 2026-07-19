@@ -1,6 +1,6 @@
 {
   "productName": "ArDali Gaming",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.ardali.gaming",
   "build": {
     "frontendDist": "../frontend"
@@ -14,7 +14,7 @@
         "width": 1320,
         "height": 820,
         "resizable": true,
-        "decorations": false,
+        "decorations": true,
         "fullscreen": false
       }
     ],

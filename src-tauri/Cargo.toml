@@ -1,6 +1,6 @@
 [package]
 name = "ardali-gaming"
-version = "0.1.0"
+version = "0.2.0"
 description = "Linux game launcher with portable Wine, Proton, and emulator management"
 authors = ["ArDali Gaming"]
 license = ""
@@ -18,10 +18,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.6.2", features = [] }
 
 [dependencies]
+ardali-core = { path = "../crates/ardali-core" }
+ardali-storage = { path = "../crates/ardali-storage" }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-rusqlite = { version = "0.32", features = ["bundled"] }
 tauri = { version = "2.11.2", features = ["protocol-asset", "image-png"] }
 tauri-plugin-log = "2"
 tauri-plugin-updater = "2"

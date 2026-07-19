@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/ardali-core", "crates/ardali-storage", "src-tauri"]
+resolver = "2"

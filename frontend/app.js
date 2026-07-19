@@ -23,6 +23,16 @@ const windowsFilePreview = document.querySelector("#windows-file-preview");
 const gameSearch = document.querySelector("#game-search");
 const libraryFilterButtons = document.querySelectorAll("[data-library-filter]");
 const playStatus = document.querySelector("#play-status");
+const playStatusObserver = new MutationObserver(() => {
+  const waiting = /aranıyor|hazırlanıyor|bekleniyor|kuruluyor/i.test(
+    playStatus.textContent || "",
+  );
+  playStatus.classList.toggle("waiting", waiting);
+});
+playStatusObserver.observe(playStatus, { childList: true, characterData: true, subtree: true });
+const operationOverlay = document.querySelector("#operation-overlay");
+const operationTitle = document.querySelector("#operation-title");
+const operationMessage = document.querySelector("#operation-message");
 const appShell = document.querySelector(".app-shell");
 const settingsDialog = document.querySelector("#settings-dialog");
 const settingsDetails = document.querySelector("#settings-details");
@@ -68,6 +78,16 @@ const steamRoot = document.querySelector("#steam-root");
 const steamLibraries = document.querySelector("#steam-libraries");
 const steamProton = document.querySelector("#steam-proton");
 const steamGames = document.querySelector("#steam-games");
+const steamLauncherStatus = document.querySelector("#steam-launcher-status");
+const steamGamemodeStatus = document.querySelector("#steam-gamemode-status");
+const steamGamescopeStatus = document.querySelector("#steam-gamescope-status");
+const steamGameSearch = document.querySelector("#steam-game-search");
+const steamGameFilter = document.querySelector("#steam-game-filter");
+const steamLibrarySummary = document.querySelector("#steam-library-summary");
+const steamToolGuidance = document.querySelector("#steam-tool-guidance");
+const steamGamemodeTest = document.querySelector("#steam-gamemode-test");
+const steamGamemodeTestResult = document.querySelector("#steam-gamemode-test-result");
+const steamGameList = document.querySelector("#steam-game-list");
 const gamescopeStatus = document.querySelector("#gamescope-status");
 const fullscreenWindowToolStatus = document.querySelector("#fullscreen-window-tool-status");
 const logList = document.querySelector("#runtime-logs");
@@ -88,6 +108,7 @@ const convertFileSrc = tauriCore?.convertFileSrc;
 const currentWindow = tauriWindow?.getCurrentWindow?.();
 let libraryGames = [];
 const gameLaunchStates = new Map();
+const gameCompletionMonitors = new Map();
 let progressHideTimer = null;
 let progressTimer = null;
 let progressStartedAt = 0;
@@ -98,7 +119,10 @@ let fullscreenToolStatus = null;
 let fullscreenToolProgressValue = null;
 let fullscreenToolProgressHideTimer = null;
 let fullscreenToolBusy = false;
+let currentSteamScan = null;
 let windowsPreviewToken = 0;
+let windowsInstallBusy = false;
+const detectedWindowsFileModes = new Map();
 let activeLibraryFilter = "all";
 const requestedWindowsIconIds = new Set();
 
@@ -153,6 +177,7 @@ const recommendedComponentSources = {
 setupWindowControls();
 setupSettingsDialogDrag();
 initButtonIcons();
+setupGamepadNavigation();
 
 const pageLabels = {
   library: {
@@ -178,6 +203,7 @@ const addButtonLabels = {
   game: "Oyun Ekle",
   "windows-app": "Uygulama Ekle",
   tool: "Araç Ekle",
+  installed: "Kurulu Uygulama Ekle",
   installer: "Kurulum Ekle",
 };
 
@@ -208,6 +234,37 @@ function setupWindowControls() {
       await currentWindow.close?.();
     }
   });
+}
+
+function setupGamepadNavigation() {
+  if (!("getGamepads" in navigator)) return;
+  let previous = [];
+  const tick = () => {
+    const pad = [...(navigator.getGamepads?.() ?? [])].find(Boolean);
+    if (pad) {
+      const pressed = pad.buttons.map((button) => button.pressed);
+      const edge = (index) => pressed[index] && !previous[index];
+      const cards = [...document.querySelectorAll("[data-page]:not([hidden]) .game-card")];
+      const current = document.activeElement?.closest?.(".game-card");
+      const index = Math.max(0, cards.indexOf(current));
+      let next = null;
+      if (edge(15) || edge(13)) next = cards[(index + 1) % cards.length];
+      if (edge(14) || edge(12)) next = cards[(index - 1 + cards.length) % cards.length];
+      if (next) next.focus();
+      if (edge(0)) {
+        (current ?? cards[0])
+          ?.querySelector(".play-button, [data-steam-action='launch'], [data-steam-action='sync']")
+          ?.click();
+      }
+      if (edge(1)) document.querySelector("[data-page-target='library']")?.click();
+      if (edge(9)) current?.querySelector(".game-settings-button, [data-steam-action='settings']")?.click();
+      previous = pressed;
+    } else {
+      previous = [];
+    }
+    window.requestAnimationFrame(tick);
+  };
+  window.requestAnimationFrame(tick);
 }
 
 function setupSettingsDialogDrag() {
@@ -307,10 +364,36 @@ document.addEventListener("click", (event) => {
   window.setTimeout(() => button.classList.remove("clicked"), 160);
 });
 
-addGameButton?.addEventListener("click", () => {
+addGameButton?.addEventListener("click", async () => {
+  if (windowsInstallBusy) {
+    return;
+  }
+  windowsInstallBusy = true;
+  addGameButton.disabled = true;
   showPage("library");
-  installPanel?.classList.toggle("visible");
-  installPanel?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  installPanel?.classList.add("visible");
+  try {
+    const path = await invoke("pick_file");
+    if (!path || !installForm) {
+      windowsInstallBusy = false;
+      addGameButton.disabled = false;
+      return;
+    }
+    // This is the exact handoff point where the native file chooser closes.
+    // Give immediate feedback before preview/icon inspection starts.
+    playStatus.textContent = "Windows dosyası seçildi, hazırlanıyor";
+    appendLog("info", `Windows dosyası seçildi: ${path}`);
+    showOperation("Dosya alındı", "Kurulum veya uygulama ekleme hazırlanıyor");
+    await nextPaint();
+    await selectInstallerPath(path);
+    await processWindowsFile();
+  } catch (error) {
+    windowsInstallBusy = false;
+    addGameButton.disabled = false;
+    hideOperation();
+    appendLog("error", String(error));
+    window.alert(`Dosya işlenemedi:\n${String(error)}`);
+  }
 });
 
 initButton?.addEventListener("click", async () => {
@@ -351,29 +434,70 @@ prefixForm?.addEventListener("submit", async (event) => {
 
 installForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
+  await processWindowsFile();
+});
 
+async function processWindowsFile() {
+  if (!installForm || !installSubmitButton) {
+    return;
+  }
   const request = installRequestFromForm();
   const validationError = validateInstallRequest(request, false);
   if (validationError) {
     appendLog("error", validationError);
-    return;
-  }
-  if (request.libraryType === "installer") {
-    appendLog("warn", "Bu dosya kurulum paketi Kur butonunu kullan");
-    updateWindowsInstallMode();
+    window.alert(validationError);
     return;
   }
 
+  const mode = windowsFileMode(request.installerPath);
+  installSubmitButton.disabled = true;
+  if (pickInstallerButton) {
+    pickInstallerButton.disabled = true;
+  }
   try {
-    const game = await invoke("add_game_installation", { request });
-    appendLog("info", `SQLite kaydı eklendi: ${game.name}`);
+    if (mode === "installer") {
+      showOperation("Lütfen bekleyin", "Wine ortamı ve kurulum sihirbazı hazırlanıyor");
+      await nextPaint();
+      await invoke("run_game_installer", { request });
+      appendLog("info", `${request.name} kurulumu başlatıldı Kurulum bitince otomatik eklenecek`);
+      playStatus.textContent = `${request.name} kuruluyor Kurulum tamamlanınca otomatik eklenecek`;
+    } else {
+      showOperation("Lütfen bekleyin", "Uygulama simgesi hazırlanıyor ve kütüphaneye ekleniyor");
+      await nextPaint();
+      const game = await invoke("add_game_installation", { request });
+      appendLog("info", `${game.name} kütüphaneye eklendi`);
+      await loadGames();
+      hideOperation();
+      windowsInstallBusy = false;
+      addGameButton.disabled = false;
+    }
     installForm.reset();
     clearWindowsFilePreview();
-    await loadGames();
+    installPanel?.classList.remove("visible");
   } catch (error) {
+    windowsInstallBusy = false;
+    addGameButton.disabled = false;
     appendLog("error", String(error));
+    hideOperation();
+    window.alert(`Dosya işlenemedi:\n${String(error)}`);
+  } finally {
+    installSubmitButton.disabled = false;
+    if (pickInstallerButton) {
+      pickInstallerButton.disabled = false;
+    }
+    updateWindowsInstallMode();
   }
-});
+}
+
+function nextPaint() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      // Let WebKit commit the visible overlay before the next synchronous
+      // Tauri command starts inspecting the selected executable.
+      window.setTimeout(resolve, 120);
+    });
+  });
+}
 
 pickInstallerButton?.addEventListener("click", async () => {
   try {
@@ -428,8 +552,15 @@ async function renderWindowsFilePreview(path) {
     }
     windowsFilePreview.replaceChildren(
       previewIcon(preview.kind, preview.iconPath),
-      previewText(preview.name, preview.path, preview.kind),
+      previewText(
+        preview.name,
+        preview.path,
+        preview.mode === "installer" ? `${preview.kind} · Kurulum sihirbazı` : `${preview.kind} · Hazır uygulama`,
+      ),
     );
+    detectedWindowsFileModes.set(path, preview.mode);
+    applyWindowsFileDefaults(path);
+    updateWindowsInstallMode();
   } catch (error) {
     if (token !== windowsPreviewToken) {
       return;
@@ -440,6 +571,7 @@ async function renderWindowsFilePreview(path) {
 
 function clearWindowsFilePreview() {
   windowsPreviewToken += 1;
+  detectedWindowsFileModes.clear();
   if (!windowsFilePreview) {
     return;
   }
@@ -517,15 +649,92 @@ steamScanButton?.addEventListener("click", async () => {
 });
 
 steamSyncButton?.addEventListener("click", async () => {
+  await syncSteamLibrary();
+});
+
+steamGameSearch?.addEventListener("input", () => renderSteamLibrary(currentSteamScan));
+steamGameFilter?.addEventListener("change", () => renderSteamLibrary(currentSteamScan));
+
+steamGamemodeTest?.addEventListener("click", async () => {
+  steamGamemodeTest.disabled = true;
+  steamGamemodeTestResult.textContent = "Test çalışıyor";
+  try {
+    const result = await invoke("test_gamemode");
+    steamGamemodeTestResult.textContent = result.passed
+      ? "GameMode testi başarılı"
+      : result.message || "GameMode testi başarısız";
+    steamGamemodeTestResult.classList.toggle("is-ready", Boolean(result.passed));
+    steamGamemodeTestResult.classList.toggle("is-error", !result.passed);
+  } catch (error) {
+    steamGamemodeTestResult.textContent = String(error);
+    steamGamemodeTestResult.classList.add("is-error");
+  } finally {
+    steamGamemodeTest.disabled = false;
+  }
+});
+
+steamGameList?.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-steam-action]");
+  if (!button) return;
+  const action = button.dataset.steamAction;
+  const appId = String(button.dataset.appId ?? "");
+  const game = libraryGames.find((item) => item.gameId === `steam-${appId}`);
+
+  if (action === "sync") {
+    await syncSteamLibrary();
+    return;
+  }
+  if (!game) return;
+
+  if (action === "settings") {
+    await invoke("open_game_settings_window", { id: game.id });
+    return;
+  }
+  if (action === "launch") {
+    try {
+      const options = currentGameModeOptions();
+      gameLaunchStates.set(game.id, "launching");
+      renderSteamLibrary(currentSteamScan);
+      const launched = await invoke("launch_game", { id: game.id, options });
+      appShell?.classList.add("playing");
+      playStatus.textContent = `${launched.name} Steam üzerinden başlatılıyor`;
+      monitorGameCompletion(game.id, launched.name);
+      await loadGames();
+      renderSteamLibrary(currentSteamScan);
+    } catch (error) {
+      gameLaunchStates.delete(game.id);
+      appendLog("error", String(error));
+      renderSteamLibrary(currentSteamScan);
+    }
+  }
+});
+
+steamGameList?.addEventListener("keydown", (event) => {
+  const card = event.target.closest(".steam-game-card");
+  if (!card) return;
+  const cards = [...steamGameList.querySelectorAll(".steam-game-card")];
+  const index = cards.indexOf(card);
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+    event.preventDefault();
+    cards[(index + 1) % cards.length]?.focus();
+  } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+    event.preventDefault();
+    cards[(index - 1 + cards.length) % cards.length]?.focus();
+  } else if (event.key === "Enter" && event.target === card) {
+    card.querySelector("button[data-steam-action='launch'], button[data-steam-action='sync']")?.click();
+  }
+});
+
+async function syncSteamLibrary() {
   try {
     const records = await invoke("sync_steam_library");
     appendLog("info", `Steam senkronizasyonu tamamlandı: ${records.length ?? 0} oyun`);
-    await scanSteam();
     await loadGames();
+    await scanSteam();
   } catch (error) {
     appendLog("error", String(error));
   }
-});
+}
 
 compatForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -609,6 +818,10 @@ appSettingsForm?.addEventListener("submit", async (event) => {
     await invoke("set_setting", {
       key: "fps_overlay",
       value: String(form.get("fps-overlay") ?? "false"),
+    });
+    await invoke("set_setting", {
+      key: "auto_sync_steam",
+      value: String(form.get("auto-sync-steam") ?? "false"),
     });
     await loadSettings();
     appendLog("info", "Genel ayarlar kaydedildi");
@@ -870,6 +1083,7 @@ libraryFilterButtons.forEach((button) => {
     });
     updateAddButtonLabel();
     renderGames(libraryGames);
+    renderSteamLibrary(currentSteamScan);
   });
 });
 
@@ -908,7 +1122,7 @@ gameList?.addEventListener("click", async (event) => {
   }
 
   const id = Number(button.dataset.id);
-  const action = button.dataset.action;
+    const action = button.dataset.action;
 
   try {
     if (action === "launch") {
@@ -916,10 +1130,17 @@ gameList?.addEventListener("click", async (event) => {
       gameLaunchStates.set(id, "launching");
       renderGames(libraryGames);
       const game = await invoke("launch_game", { id, options });
-      gameLaunchStates.set(id, "running");
+      const steamLaunch = game.gameKind === "steam";
+      if (!steamLaunch) {
+        gameLaunchStates.set(id, "running");
+      }
       appShell?.classList.add("playing");
-      playStatus.textContent = `${game.name} çalışıyor ArDali Gaming arka planda`;
-      appendLog("info", `Başlatıldı: ${game.name} (${options.displayMode})`);
+      const running = gameLaunchStates.get(id) === "running";
+      playStatus.textContent = running
+        ? `${game.name} çalışıyor ArDali Gaming arka planda`
+        : `${game.name} Steam üzerinden başlatılıyor`;
+      appendLog("info", `${steamLaunch ? "Başlatma istendi" : "Başlatıldı"}: ${game.name} (${options.displayMode})`);
+      monitorGameCompletion(id, game.name);
       await loadGames();
     }
 
@@ -935,10 +1156,28 @@ gameList?.addEventListener("click", async (event) => {
       await loadGames();
     }
 
+    if (action === "uninstall") {
+      const game = libraryGames.find((item) => item.id === id);
+      if (!game) {
+        return;
+      }
+      showOperation("Uygulama kaldırılıyor", "Wine kaldırma işlemi çalışıyor; lütfen bekleyin");
+      await invoke("uninstall_windows_app", { id });
+      hideOperation();
+      appendLog("info", `${game.name} Wine içinden kaldırıldı`);
+      playStatus.textContent = `${game.name} kaldırıldı`;
+      await loadGames();
+    }
+
+
   } catch (error) {
     if (action === "launch") {
       gameLaunchStates.delete(id);
       renderGames(libraryGames);
+    }
+    if (action === "uninstall") {
+      hideOperation();
+      window.alert(`Kaldırma işlemi başarısız oldu:\n${String(error)}`);
     }
     appendLog("error", String(error));
   }
@@ -947,6 +1186,19 @@ gameList?.addEventListener("click", async (event) => {
 if (tauriEvent?.listen) {
   tauriEvent.listen("backend-log", (event) => {
     appendLog(event.payload.level, event.payload.message);
+    if (operationOverlay && !operationOverlay.hidden) {
+      const message = String(event.payload.message ?? "");
+      if (/Installer başlatıldı/i.test(message)) {
+        // Wine has been spawned, but the native wizard needs a short moment
+        // to map its window. Keep the transition message visible briefly so
+        // the file chooser -> Wine handoff never looks like a frozen UI.
+        window.setTimeout(() => hideOperation(), 4000);
+        playStatus.textContent = "Windows kurulum sihirbazı açık";
+      } else if (/Kurulum tamamlandı/i.test(message)) {
+        operationTitle.textContent = "Kütüphaneye ekleniyor";
+        operationMessage.textContent = "Kurulum tamamlandı, yeni uygulama aranıyor";
+      }
+    }
   });
   tauriEvent.listen("download-progress", (event) => {
     renderDownloadProgress(event.payload);
@@ -955,26 +1207,110 @@ if (tauriEvent?.listen) {
     const payload = event.payload;
     setCncNetProgress(Number(payload.id), Number(payload.percent ?? 1), payload.status ?? "");
   });
+  tauriEvent.listen("install-progress", async (event) => {
+    const payload = event.payload ?? {};
+    const status = String(payload.status ?? "Kurulum devam ediyor");
+    const percent = Number(payload.percent ?? 0);
+    if (payload.kind === "windows-installer" && percent < 40 && operationOverlay?.hidden) {
+      showOperation("Kurulum hazırlanıyor", status);
+    }
+    playStatus.textContent = status;
+    appendLog("info", status);
+    if (percent >= 100) {
+      hideOperation();
+      windowsInstallBusy = false;
+      if (addGameButton) {
+        addGameButton.disabled = false;
+      }
+      await loadGames();
+    }
+  });
   tauriEvent.listen("game-ended", async (event) => {
     const payload = event.payload;
-    gameLaunchStates.delete(Number(payload.id));
-    appShell?.classList.remove("playing");
-    playStatus.textContent = `${payload.name} kapandı ArDali Gaming geri döndü`;
-    appendLog("info", `${payload.name} kapandı: ${payload.status}`);
-    await loadGames();
+    await finishGameUi(Number(payload.id), payload.name, payload.status);
+  });
+  tauriEvent.listen("game-started", async (event) => {
+    const payload = event.payload ?? {};
+    const id = Number(payload.id);
+    if (!gameLaunchStates.has(id)) {
+      return;
+    }
+    gameLaunchStates.set(id, "running");
+    playStatus.textContent = `${payload.name} çalışıyor ArDali Gaming arka planda`;
+    renderGames(libraryGames);
   });
   tauriEvent.listen("library-changed", async () => {
+    hideOperation();
     await loadGames();
+    window.setTimeout(() => loadGames(), 500);
     await refreshSystemTools(true);
   });
+}
+
+function showOperation(title, message) {
+  if (!operationOverlay) {
+    return;
+  }
+  operationTitle.textContent = title;
+  operationMessage.textContent = message;
+  operationOverlay.hidden = false;
+}
+
+function hideOperation() {
+  if (operationOverlay) {
+    operationOverlay.hidden = true;
+  }
+}
+
+async function finishGameUi(id, name, status) {
+  if (!gameLaunchStates.has(id)) {
+    return;
+  }
+
+  gameLaunchStates.delete(id);
+  const monitor = gameCompletionMonitors.get(id);
+  if (monitor) {
+    window.clearTimeout(monitor);
+    gameCompletionMonitors.delete(id);
+  }
+  if (!gameLaunchStates.size) {
+    appShell?.classList.remove("playing");
+  }
+  playStatus.textContent = `${name} kapandı ArDali Gaming geri döndü`;
+  appendLog("info", `${name} kapandı: ${status}`);
+  await loadGames();
+}
+
+function monitorGameCompletion(id, name) {
+  const check = async () => {
+    if (!gameLaunchStates.has(id)) {
+      gameCompletionMonitors.delete(id);
+      return;
+    }
+
+    try {
+      const game = await invoke("game_settings", { id });
+      if (!game.activeSessionId) {
+        await finishGameUi(id, name, "oturum tamamlandı");
+        return;
+      }
+    } catch (error) {
+      appendLog("warn", `${name} kapanış durumu kontrol edilemedi: ${error}`);
+    }
+
+    const timer = window.setTimeout(check, 1500);
+    gameCompletionMonitors.set(id, timer);
+  };
+
+  const timer = window.setTimeout(check, 1500);
+  gameCompletionMonitors.set(id, timer);
 }
 
 if (applyBackendAvailability()) {
   initializeRuntime();
   initializeEmulators();
   loadGames();
-  scanSteam();
-  loadSettings();
+  bootstrapSteamIntegration();
   refreshSystemTools();
   loadComponentUpdates();
 }
@@ -1024,6 +1360,7 @@ async function loadGames() {
     libraryGames = Array.isArray(games) ? games : [];
     await clearDetachedGameSessions();
     renderGames(libraryGames);
+    renderSteamLibrary(currentSteamScan);
     renderCompatibilityGames(libraryGames);
     renderMetadataGames(libraryGames);
     await refreshMissingWindowsIcons();
@@ -1077,7 +1414,13 @@ async function clearDetachedGameSessions() {
     try {
       const cleared = await invoke("clear_game_session", { id: game.id });
       Object.assign(game, cleared);
-      appendLog("info", `${game.name} önceki çalışma durumu otomatik temizlendi`);
+      if (cleared.activeSessionId) {
+        gameLaunchStates.set(game.id, "running");
+        monitorGameCompletion(game.id, game.name);
+        appendLog("info", `${game.name} çalışan Steam sürecinden geri yüklendi`);
+      } else {
+        appendLog("info", `${game.name} önceki çalışma durumu otomatik temizlendi`);
+      }
     } catch (error) {
       appendLog("warn", `${game.name} çalışma durumu temizlenemedi: ${error}`);
     }
@@ -1101,9 +1444,20 @@ async function refreshCompatibilityReport() {
 async function loadSettings() {
   try {
     const settings = await invoke("list_settings");
-    renderSettings(Array.isArray(settings) ? settings : []);
+    const list = Array.isArray(settings) ? settings : [];
+    renderSettings(list);
+    return Object.fromEntries(list.map((setting) => [setting.key, setting.value]));
   } catch (error) {
     appendLog("error", String(error));
+    return {};
+  }
+}
+
+async function bootstrapSteamIntegration() {
+  const settings = await loadSettings();
+  await scanSteam();
+  if (settings.auto_sync_steam === "true") {
+    await syncSteamLibrary();
   }
 }
 
@@ -1188,7 +1542,12 @@ async function refreshRecommendedComponentUpdates(updates) {
 
 async function scanSteam() {
   try {
-    const scan = await invoke("scan_steam");
+    const [scan, tools] = await Promise.all([
+      invoke("scan_steam"),
+      invoke("fullscreen_tool_status"),
+    ]);
+    currentSteamScan = scan;
+    fullscreenToolStatus = tools;
     renderSteam(scan);
   } catch (error) {
     appendLog("error", String(error));
@@ -1523,9 +1882,9 @@ function updateWindowsInstallMode() {
       runInstallerButton.disabled = false;
     }
     if (installSubmitButton) {
-      installSubmitButton.textContent = "Doğrudan Ekle";
-      installSubmitButton.disabled = true;
-      installSubmitButton.title = "Kurulum paketi için Kur butonunu kullan";
+      installSubmitButton.textContent = "Otomatik Kur";
+      installSubmitButton.disabled = false;
+      installSubmitButton.removeAttribute("title");
     }
     return;
   }
@@ -1540,7 +1899,7 @@ function updateWindowsInstallMode() {
       prefixModeSelect.value = "shared-windows-apps";
     }
     if (installModeMessage) {
-      installModeMessage.textContent = "Bu dosya doğrudan çalışabilir Kütüphaneye Ekle ile kaydedilir";
+      installModeMessage.textContent = "Hazır uygulama algılandı doğrudan kütüphaneye eklenecek";
     }
     if (runInstallerButton) {
       runInstallerButton.textContent = "Kur";
@@ -1555,8 +1914,7 @@ function updateWindowsInstallMode() {
   }
 
   if (installModeMessage) {
-    installModeMessage.textContent =
-      "Dosya tipi net değil kurulum gerekiyorsa Kur doğrudan çalışıyorsa Kütüphaneye Ekle";
+    installModeMessage.textContent = "Dosya seçildiğinde işlem türü otomatik belirlenecek";
   }
   if (runInstallerButton) {
     runInstallerButton.textContent = "Kur";
@@ -1570,6 +1928,10 @@ function updateWindowsInstallMode() {
 }
 
 function windowsFileMode(path) {
+  const detectedMode = detectedWindowsFileModes.get(String(path || ""));
+  if (detectedMode) {
+    return detectedMode;
+  }
   const fileName = String(path || "")
     .split("/")
     .pop()
@@ -1595,7 +1957,7 @@ function windowsFileMode(path) {
   ) {
     return "installer";
   }
-  return "unknown";
+  return "direct";
 }
 
 function guessGameName(path) {
@@ -1633,7 +1995,10 @@ function renderGames(games) {
   const filteredGames = games.filter((game) => {
     const matchesSearch = !query || game.name.toLowerCase().includes(query);
     const matchesType =
-      activeLibraryFilter === "all" || libraryTypeForGame(game) === activeLibraryFilter;
+      activeLibraryFilter === "all" ||
+      (activeLibraryFilter === "installed"
+        ? isWineInstalledApp(game)
+        : libraryTypeForGame(game) === activeLibraryFilter);
     return matchesSearch && matchesType;
   });
 
@@ -1654,6 +2019,7 @@ function renderGames(games) {
       const usesAppIcon = libraryType === "windows-app" || libraryType === "tool";
       const row = document.createElement("article");
       row.className = "game-card";
+      row.tabIndex = 0;
       row.classList.toggle("game-card-app", usesAppIcon);
 
       const cover = document.createElement("div");
@@ -1685,6 +2051,32 @@ function renderGames(games) {
         badge(libraryTypeLabel(libraryType), "type"),
         badge(runnerLabel(game), "runner"),
       );
+      if (game.gameKind === "steam" && game.sourceAvailable === false) {
+        meta.append(badge("Kurulu değil", "unavailable"));
+      }
+      if (game.gamemodeEnabled) {
+        const active = gameLaunchStates.get(game.id) === "running";
+        meta.append(
+          badge(
+            fullscreenToolStatus?.gamemode
+              ? active
+                ? "GameMode aktif"
+                : "GameMode hazır"
+              : "GameMode eksik",
+            "gamemode",
+          ),
+        );
+      }
+
+      const activity = document.createElement("div");
+      activity.className = "game-card-activity";
+      const playtime = document.createElement("span");
+      playtime.textContent = `Toplam ${playtimeLabel(game.totalPlaytimeSeconds)}`;
+      playtime.title = "Toplam kullanım süresi";
+      const lastPlayed = document.createElement("span");
+      lastPlayed.textContent = `Son: ${lastPlayedLabel(game.lastPlayedAt)}`;
+      lastPlayed.title = "Son çalıştırılma tarihi";
+      activity.append(playtime, lastPlayed);
 
       const settings = actionButton("⚙", "settings", game.id);
       settings.className = "game-settings-button";
@@ -1702,8 +2094,13 @@ function renderGames(games) {
       if (progress && progress.percent < 100) {
         actions.append(cncNetProgressElement(progress));
       }
+      if (activeLibraryFilter === "installed" && isWineInstalledApp(game)) {
+        const uninstall = actionButton("Kaldır", "uninstall", game.id);
+        uninstall.className = "uninstall-game-button";
+        actions.append(uninstall);
+      }
 
-      body.append(titleHeading, meta);
+      body.append(titleHeading, meta, activity);
       row.append(settings, cover, body, actions);
       return row;
     }),
@@ -1759,7 +2156,7 @@ function runnerLabel(game) {
   const labels = {
     wine: "Wine",
     proton: "Proton",
-    "steam-proton": "Steam Proton",
+    steam: "Steam",
     openra: "OpenRA",
     "dosbox-x": "DOSBox-X",
     cncnet: "CnCNet",
@@ -1829,6 +2226,11 @@ function playButton(game) {
   if (state) {
     button.disabled = true;
     button.classList.add(`is-${state}`);
+  }
+  if (game.sourceAvailable === false) {
+    button.disabled = true;
+    button.textContent = "Kullanılamıyor";
+    button.title = "Steam oyunu kurulu değil veya kütüphane diski bağlı değil";
   }
   return button;
 }
@@ -1930,8 +2332,16 @@ function renderSettings(settings) {
   if (map.fps_overlay) {
     appSettingsForm.elements["fps-overlay"].value = map.fps_overlay;
   }
-  if (metadataForm?.elements["steamgriddb-key"] && map.steamgriddb_api_key) {
-    metadataForm.elements["steamgriddb-key"].value = map.steamgriddb_api_key;
+  if (map.auto_sync_steam) {
+    appSettingsForm.elements["auto-sync-steam"].value = map.auto_sync_steam;
+  }
+  if (metadataForm?.elements["steamgriddb-key"]) {
+    const keyInput = metadataForm.elements["steamgriddb-key"];
+    keyInput.value = "";
+    keyInput.placeholder =
+      map.steamgriddb_api_key_configured === "true"
+        ? "SteamGridDB anahtarı kayıtlı (değiştirmek için yaz)"
+        : "SteamGridDB API anahtarı";
   }
 }
 
@@ -2080,11 +2490,14 @@ function showSettings(game) {
   if (removeButton) {
     removeButton.textContent = removeLabelForGame(game);
     removeButton.title = removeButton.textContent;
+    removeButton.hidden = isWineInstalledApp(game);
   }
   settingsDetails.replaceChildren(
     settingsField("Runner", gameKindSelect(game.gameKind)),
     settingsField("Windows sürümü", windowsVersionSelect(game.windowsVersion)),
     settingsField("Wine prefix yolu", readonlyInput(game.prefixPath ?? "Yok")),
+    steamLaunchOptionsField(game),
+    steamCompatibilityField(game),
     settingsField("DXVK", checkboxInput("dxvk-enabled", game.dxvkEnabled)),
     settingsField(
       "DLL override",
@@ -2093,6 +2506,7 @@ function showSettings(game) {
     settingsField("Ekran modu", displayModeSelect(game.displayMode)),
     settingsField("Sanal Masaüstü", checkboxInput("virtual-desktop", game.virtualDesktop)),
     settingsField("Gamescope ölçekleme", checkboxInput("gamescope-enabled", game.gamescopeEnabled)),
+    settingsField("GameMode performans", checkboxInput("gamemode-enabled", game.gamemodeEnabled)),
     settingsField("Çözünürlük", resolutionSelect(game.resolution)),
     settingsField("Ölçekleme modu", gamescopeScalerSelect(game.gamescopeScaler)),
     settingsField("ddraw override", checkboxInput("ddraw-override", game.ddrawOverride)),
@@ -2102,6 +2516,7 @@ function showSettings(game) {
     ),
   );
   syncDirectDrawSettings();
+  loadSteamCompatibility(game);
   gameSettingsForm.elements["ddraw-override"]?.addEventListener("change", syncDirectDrawSettings);
   gameSettingsForm.elements["windows-version"]?.addEventListener("change", applyWindowsVersionDefaults);
   gameSettingsForm.elements["display-mode"]?.addEventListener("change", renderFullscreenToolWarning);
@@ -2125,6 +2540,8 @@ async function saveGameSettings() {
     displayMode: String(form.get("display-mode") ?? "windowed"),
     virtualDesktop: form.get("virtual-desktop") === "on",
     gamescopeEnabled: form.get("gamescope-enabled") === "on",
+    gamemodeEnabled: form.get("gamemode-enabled") === "on",
+    steamLaunchOptions: String(form.get("steam-launch-options") ?? "").trim(),
     resolution: String(form.get("resolution") ?? "auto"),
     gamescopeScaler: String(form.get("gamescope-scaler") ?? "fit"),
     protondbNote: String(form.get("protondb-note") ?? "").trim() || null,
@@ -2133,6 +2550,14 @@ async function saveGameSettings() {
   };
 
   try {
+    if (gameKind === "steam") {
+      const appId = String(activeSettingsGame.gameId ?? "").replace(/^steam-/, "");
+      const toolSelect = gameSettingsForm.elements["steam-compat-tool"];
+      if (toolSelect.value !== toolSelect.dataset.initialValue) {
+        const toolName = toolSelect.value.trim() || null;
+        await invoke("set_steam_compatibility_tool", { appId, toolName });
+      }
+    }
     const game = await invoke("update_game_settings", { id, settings });
     appendLog("info", `${game.name} ayarları kaydedildi`);
     settingsDialog.close();
@@ -2160,6 +2585,12 @@ async function removeGameFromSettings() {
   }
 
   try {
+    showOperation(
+      wineInstalledApp ? "Uygulama kaldırılıyor" : "Kütüphane güncelleniyor",
+      wineInstalledApp
+        ? "Wine kaldırma işlemi çalışıyor; lütfen bekleyin"
+        : "Kayıt kütüphaneden kaldırılıyor",
+    );
     if (wineInstalledApp) {
       await invoke("uninstall_windows_app", { id });
     } else {
@@ -2175,16 +2606,37 @@ async function removeGameFromSettings() {
     await loadGames();
   } catch (error) {
     appendLog("error", String(error));
+    hideOperation();
+    window.alert(`Kaldırma işlemi başarısız oldu:\n${String(error)}`);
   }
 }
 
 function isWineInstalledApp(game) {
   const runner = game?.preferredRunner || game?.preferred_runner || game?.runner;
+  const prefixPath = String(game?.prefixPath || game?.prefix_path || "");
+  const targetPath = windowsTargetPath(game);
   return (
     libraryTypeForGame(game) === "windows-app" &&
     runner === "wine" &&
-    Boolean(game.prefixPath || game.prefix_path)
+    Boolean(prefixPath) &&
+    pathIsInsideWinePrefix(targetPath, prefixPath)
   );
+}
+
+function windowsTargetPath(game) {
+  const argumentsList = Array.isArray(game?.arguments) ? game.arguments : [];
+  return String(
+    argumentsList[0] ||
+      game?.installerPath ||
+      game?.installer_path ||
+      "",
+  );
+}
+
+function pathIsInsideWinePrefix(targetPath, prefixPath) {
+  const normalizedTarget = String(targetPath).replaceAll("\\", "/").replace(/\/+$/, "");
+  const normalizedPrefix = String(prefixPath).replaceAll("\\", "/").replace(/\/+$/, "");
+  return Boolean(normalizedTarget) && normalizedTarget.startsWith(`${normalizedPrefix}/drive_c/`);
 }
 
 function removeLabelForGame(game) {
@@ -2681,6 +3133,44 @@ function settingsField(label, control) {
   return wrapper;
 }
 
+function steamLaunchOptionsField(game) {
+  const field = settingsField(
+    "Steam başlatma seçenekleri",
+    textInput("steam-launch-options", game.steamLaunchOptions ?? "", '-novid "-windowed"'),
+  );
+  field.hidden = game.gameKind !== "steam";
+  return field;
+}
+
+function steamCompatibilityField(game) {
+  const select = document.createElement("select");
+  select.name = "steam-compat-tool";
+  select.append(option("", "Steam varsayılanı", ""));
+  const field = settingsField("Steam Proton sürümü", select);
+  field.hidden = game.gameKind !== "steam";
+  return field;
+}
+
+async function loadSteamCompatibility(game) {
+  if (game.gameKind !== "steam") return;
+  const select = gameSettingsForm.elements["steam-compat-tool"];
+  const appId = String(game.gameId ?? "").replace(/^steam-/, "");
+  try {
+    const status = await invoke("steam_compatibility_status", { appId });
+    status.tools?.forEach((tool) =>
+      select.append(option(tool.name, tool.displayName, status.selectedTool ?? "")),
+    );
+    select.value = status.selectedTool ?? "";
+    select.dataset.initialValue = select.value;
+    select.title = status.steamRunning
+      ? "Değiştirmek için önce Steam istemcisini tamamen kapat"
+      : status.configPath ?? "Steam yapılandırması bulunamadı";
+  } catch (error) {
+    select.disabled = true;
+    select.title = String(error);
+  }
+}
+
 function gameKindSelect(value) {
   const select = document.createElement("select");
   select.name = "game-kind";
@@ -2699,7 +3189,7 @@ function gameKindSelect(value) {
 
 function runnerForGameKind(value) {
   if (value === "steam") {
-    return "steam-proton";
+    return "steam";
   }
   if (value.startsWith("open-ra")) {
     return "openra";
@@ -2823,9 +3313,12 @@ function playtimeLabel(seconds) {
   if (total <= 0) {
     return "0 dk";
   }
+  if (total < 60) {
+    return "<1 dk";
+  }
 
   const hours = Math.floor(total / 3600);
-  const minutes = Math.max(1, Math.floor((total % 3600) / 60));
+  const minutes = Math.floor((total % 3600) / 60);
   return hours > 0 ? `${hours} sa ${minutes} dk` : `${minutes} dk`;
 }
 
@@ -2837,7 +3330,129 @@ function renderSteam(scan) {
   steamRoot.textContent = summarizeList(scan.steamRoots);
   steamLibraries.textContent = `${scan.libraryDirs?.length ?? 0} kütüphane`;
   steamProton.textContent = summarizeList(scan.protonVersions);
-  steamGames.textContent = `${scan.games?.length ?? 0} oyun bulundu`;
+  const games = Array.isArray(scan.games) ? scan.games : [];
+  const installedGames = games.filter((game) => game.installed).length;
+  steamGames.textContent = `${installedGames} kurulu oyun (${games.length} manifest)`;
+  steamLauncherStatus.textContent = scan.launcherCommand
+    ? `Hazır · ${shortPath(scan.launcherCommand)}`
+    : "Bulunamadı";
+  steamGamemodeStatus.textContent = fullscreenToolStatus?.gamemode ? "Hazır" : "Kurulu değil";
+  steamGamescopeStatus.textContent = fullscreenToolStatus?.gamescope ? "Hazır" : "Kurulu değil";
+  const missingTools = [
+    !scan.launcherCommand ? "Steam istemcisi bulunamadı" : null,
+    !fullscreenToolStatus?.gamemode ? "GameMode için dağıtımının gamemode paketini kur" : null,
+    !fullscreenToolStatus?.gamescope ? "Gamescope isteğe bağlı tam ekran ölçekleme için kurulu değil" : null,
+  ].filter(Boolean);
+  steamToolGuidance.hidden = missingTools.length === 0;
+  steamToolGuidance.textContent = missingTools.join(" · ");
+  renderSteamLibrary(scan);
+}
+
+function renderSteamLibrary(scan) {
+  if (!steamGameList || !steamLibrarySummary) return;
+  const games = Array.isArray(scan?.games) ? scan.games : [];
+  const query = steamGameSearch?.value?.trim().toLocaleLowerCase("tr") ?? "";
+  const filter = steamGameFilter?.value ?? "installed";
+  const syncedByAppId = new Map(
+    libraryGames
+      .filter((game) => game.gameKind === "steam")
+      .map((game) => [String(game.gameId).replace(/^steam-/, ""), game]),
+  );
+  const visible = games.filter((game) => {
+    const synced = syncedByAppId.has(String(game.appId));
+    const matchesFilter =
+      filter === "all" || (filter === "synced" ? synced : Boolean(game.installed));
+    const haystack = `${game.name} ${game.appId} ${game.installDir}`.toLocaleLowerCase("tr");
+    return matchesFilter && (!query || haystack.includes(query));
+  });
+
+  steamLibrarySummary.textContent = `${visible.length} gösteriliyor · ${games.length} manifest`;
+  if (!visible.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-library-state";
+    empty.textContent = games.length ? "Bu Steam filtresinde oyun yok" : "Steam oyunu bulunamadı";
+    steamGameList.replaceChildren(empty);
+    return;
+  }
+
+  steamGameList.replaceChildren(
+    ...visible.map((manifest) => {
+      const synced = syncedByAppId.get(String(manifest.appId));
+      const card = document.createElement("article");
+      card.className = "game-card steam-game-card";
+      card.tabIndex = 0;
+      card.dataset.appId = manifest.appId;
+
+      const cover = document.createElement("div");
+      cover.className = "cover steam-cover";
+      const coverPath = synced?.coverPath || manifest.coverPath;
+      if (coverPath) {
+        const image = document.createElement("img");
+        image.src = coverImageSrc(coverPath);
+        image.alt = `${manifest.name} kapağı`;
+        image.loading = "lazy";
+        image.addEventListener("error", () => cover.replaceChildren(initials(manifest.name)));
+        cover.append(image);
+      } else {
+        cover.textContent = initials(manifest.name);
+      }
+
+      const body = document.createElement("div");
+      body.className = "game-card-body";
+      const heading = document.createElement("h3");
+      heading.textContent = manifest.name;
+      const meta = document.createElement("div");
+      meta.className = "game-card-meta";
+      meta.append(
+        badge(`AppID ${manifest.appId}`, "type"),
+        badge(manifest.installed ? "Kurulu" : "Manifest", "runner"),
+      );
+      if (synced) meta.append(badge("ArDali’de", "synced"));
+      if (synced?.gamemodeEnabled) {
+        const active = gameLaunchStates.get(synced.id) === "running";
+        meta.append(
+          badge(
+            fullscreenToolStatus?.gamemode
+              ? active
+                ? "GameMode aktif"
+                : "GameMode hazır"
+              : "GameMode eksik",
+            "gamemode",
+          ),
+        );
+      }
+      const detail = document.createElement("p");
+      detail.className = "steam-card-path";
+      detail.textContent = shortPath(manifest.installDir);
+      detail.title = manifest.installDir;
+      body.append(heading, meta, detail);
+
+      const actions = document.createElement("div");
+      actions.className = "game-actions steam-card-actions";
+      if (synced) {
+        const launch = document.createElement("button");
+        const state = gameLaunchStates.get(synced.id) ?? (synced.activeSessionId ? "running" : null);
+        launch.textContent = state === "launching" ? "Başlatılıyor" : state === "running" ? "Çalışıyor" : "Başlat";
+        launch.dataset.steamAction = "launch";
+        launch.dataset.appId = manifest.appId;
+        launch.disabled = Boolean(state);
+        const settings = document.createElement("button");
+        settings.textContent = "Ayarlar";
+        settings.dataset.steamAction = "settings";
+        settings.dataset.appId = manifest.appId;
+        actions.append(launch, settings);
+      } else {
+        const sync = document.createElement("button");
+        sync.textContent = "ArDali’ye Ekle";
+        sync.dataset.steamAction = "sync";
+        sync.dataset.appId = manifest.appId;
+        actions.append(sync);
+      }
+
+      card.append(cover, body, actions);
+      return card;
+    }),
+  );
 }
 
 function summarizeList(items) {

@@ -1,7 +1,6 @@
-use crate::runtime::{self, RunnerKind};
+use crate::runtime::{self, RunnerKind, RuntimeEventSink};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path, process::Command};
-use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,7 +77,7 @@ pub fn check_components() -> Result<Vec<ComponentUpdate>, String> {
 }
 
 pub fn update_component(
-    app: &AppHandle,
+    app: &dyn RuntimeEventSink,
     request: ComponentUpdateRequest,
 ) -> Result<ComponentUpdate, String> {
     let kind = runner_kind(&request.component)?;
@@ -102,7 +101,10 @@ pub fn update_component(
     })
 }
 
-pub fn remove_component(app: &AppHandle, component: String) -> Result<ComponentUpdate, String> {
+pub fn remove_component(
+    app: &dyn RuntimeEventSink,
+    component: String,
+) -> Result<ComponentUpdate, String> {
     let kind = runner_kind(&component)?;
     let paths = runtime::runtime_paths()?;
     let target = component_install_path(&paths, &kind);
@@ -150,6 +152,7 @@ fn runner_kind(component: &str) -> Result<RunnerKind, String> {
 fn component_install_path(paths: &runtime::RuntimePaths, kind: &RunnerKind) -> std::path::PathBuf {
     match kind {
         RunnerKind::Wine => Path::new(&paths.wine_dir).join("current"),
+        RunnerKind::Steam => Path::new(&paths.components_dir).join("steam-system"),
         RunnerKind::Proton => Path::new(&paths.proton_dir).join("current"),
         RunnerKind::Dxvk => Path::new(&paths.components_dir).join("dxvk/current"),
         RunnerKind::Vkd3d => Path::new(&paths.components_dir).join("vkd3d/current"),

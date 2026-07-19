@@ -1,0 +1,13 @@
+[package]
+name = "ardali-core"
+version = "0.2.0"
+description = "UI-independent domain models and contracts for ArDali Gaming"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

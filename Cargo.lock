@@ -97,17 +97,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "ardali-gaming"
-version = "0.1.0"
+name = "ardali-core"
+version = "0.2.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ardali-gaming"
+version = "0.2.0"
+dependencies = [
+ "ardali-core",
+ "ardali-storage",
  "log",
- "rusqlite",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-log",
  "tauri-plugin-updater",
+]
+
+[[package]]
+name = "ardali-storage"
+version = "0.2.0"
+dependencies = [
+ "ardali-core",
+ "rusqlite",
 ]
 
 [[package]]

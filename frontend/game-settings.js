@@ -124,6 +124,8 @@ function showSettings(game) {
       settingsField("Runner", gameKindSelect(game.gameKind)),
       settingsField("Windows sürümü", windowsVersionSelect(game.windowsVersion)),
       settingsField("Wine prefix yolu", readonlyInput(game.prefixPath ?? "Yok"), true),
+      steamLaunchOptionsField(game),
+      steamCompatibilityField(game),
     ),
     settingsGroup(
       "Görüntü",
@@ -132,6 +134,7 @@ function showSettings(game) {
       settingsField("Ölçekleme modu", gamescopeScalerSelect(game.gamescopeScaler)),
       settingsField("Sanal Masaüstü", checkboxInput("virtual-desktop", game.virtualDesktop)),
       settingsField("Gamescope ölçekleme", checkboxInput("gamescope-enabled", game.gamescopeEnabled)),
+      settingsField("GameMode performans", checkboxInput("gamemode-enabled", game.gamemodeEnabled)),
     ),
     settingsGroup(
       "Uyumluluk",
@@ -142,6 +145,7 @@ function showSettings(game) {
     ),
   );
   syncDirectDrawSettings();
+  loadSteamCompatibility(game);
   gameSettingsForm.elements["ddraw-override"]?.addEventListener("change", syncDirectDrawSettings);
   gameSettingsForm.elements["windows-version"]?.addEventListener("change", applyWindowsVersionDefaults);
   gameSettingsForm.elements["display-mode"]?.addEventListener("change", renderFullscreenToolWarning);
@@ -163,6 +167,8 @@ async function saveGameSettings() {
     displayMode: String(form.get("display-mode") ?? "windowed"),
     virtualDesktop: form.get("virtual-desktop") === "on",
     gamescopeEnabled: form.get("gamescope-enabled") === "on",
+    gamemodeEnabled: form.get("gamemode-enabled") === "on",
+    steamLaunchOptions: String(form.get("steam-launch-options") ?? "").trim(),
     resolution: String(form.get("resolution") ?? "auto"),
     gamescopeScaler: String(form.get("gamescope-scaler") ?? "fit"),
     protondbNote: String(form.get("protondb-note") ?? "").trim() || null,
@@ -180,6 +186,14 @@ async function saveGameSettings() {
   }
 
   try {
+    if (gameKind === "steam") {
+      const appId = String(activeSettingsGame.gameId ?? "").replace(/^steam-/, "");
+      const toolSelect = gameSettingsForm.elements["steam-compat-tool"];
+      if (toolSelect.value !== toolSelect.dataset.initialValue) {
+        const toolName = toolSelect.value.trim() || null;
+        await invoke("set_steam_compatibility_tool", { appId, toolName });
+      }
+    }
     await invoke("update_game_settings", { id, settings });
     closeSettingsWindow();
   } catch (error) {
@@ -204,6 +218,10 @@ async function removeGameFromSettings() {
   }
 
   try {
+    if (removeButton) {
+      removeButton.disabled = true;
+      removeButton.textContent = "Kaldırılıyor, lütfen bekleyin…";
+    }
     if (wineInstalledApp) {
       await invoke("uninstall_windows_app", { id });
     } else {
@@ -211,7 +229,12 @@ async function removeGameFromSettings() {
     }
     closeSettingsWindow();
   } catch (error) {
+    if (removeButton) {
+      removeButton.disabled = false;
+      updateRemoveButton(activeSettingsGame);
+    }
     console.error(error);
+    window.alert(`Kaldırma işlemi başarısız oldu:\n${String(error)}`);
   }
 }
 
@@ -223,15 +246,35 @@ function updateRemoveButton(game) {
     ? "Uygulamayı Wine’dan Kaldır"
     : "Kütüphaneden Sil";
   removeButton.title = removeButton.textContent;
+  removeButton.hidden = isWineInstalledApp(game);
 }
 
 function isWineInstalledApp(game) {
   const runner = game?.preferredRunner || game?.preferred_runner || game?.runner;
+  const prefixPath = String(game?.prefixPath || game?.prefix_path || "");
+  const targetPath = windowsTargetPath(game);
   return (
     libraryTypeForGame(game) === "windows-app" &&
     runner === "wine" &&
-    Boolean(game?.prefixPath || game?.prefix_path)
+    Boolean(prefixPath) &&
+    pathIsInsideWinePrefix(targetPath, prefixPath)
   );
+}
+
+function windowsTargetPath(game) {
+  const argumentsList = Array.isArray(game?.arguments) ? game.arguments : [];
+  return String(
+    argumentsList[0] ||
+      game?.installerPath ||
+      game?.installer_path ||
+      "",
+  );
+}
+
+function pathIsInsideWinePrefix(targetPath, prefixPath) {
+  const normalizedTarget = String(targetPath).replaceAll("\\", "/").replace(/\/+$/, "");
+  const normalizedPrefix = String(prefixPath).replaceAll("\\", "/").replace(/\/+$/, "");
+  return Boolean(normalizedTarget) && normalizedTarget.startsWith(`${normalizedPrefix}/drive_c/`);
 }
 
 function libraryTypeForGame(game) {
@@ -616,6 +659,45 @@ function settingsField(label, control, wide = false) {
   return wrapper;
 }
 
+function steamLaunchOptionsField(game) {
+  const field = settingsField(
+    "Steam başlatma seçenekleri",
+    textInput("steam-launch-options", game.steamLaunchOptions ?? "", '-novid "-windowed"'),
+    true,
+  );
+  field.hidden = game.gameKind !== "steam";
+  return field;
+}
+
+function steamCompatibilityField(game) {
+  const select = document.createElement("select");
+  select.name = "steam-compat-tool";
+  select.append(option("", "Steam varsayılanı", ""));
+  const field = settingsField("Steam Proton sürümü", select, true);
+  field.hidden = game.gameKind !== "steam";
+  return field;
+}
+
+async function loadSteamCompatibility(game) {
+  if (game.gameKind !== "steam") return;
+  const select = gameSettingsForm.elements["steam-compat-tool"];
+  const appId = String(game.gameId ?? "").replace(/^steam-/, "");
+  try {
+    const status = await invoke("steam_compatibility_status", { appId });
+    status.tools?.forEach((tool) =>
+      select.append(option(tool.name, tool.displayName, status.selectedTool ?? "")),
+    );
+    select.value = status.selectedTool ?? "";
+    select.dataset.initialValue = select.value;
+    select.title = status.steamRunning
+      ? "Değiştirmek için önce Steam istemcisini tamamen kapat"
+      : status.configPath ?? "Steam yapılandırması bulunamadı";
+  } catch (error) {
+    select.disabled = true;
+    select.title = String(error);
+  }
+}
+
 function gameKindSelect(value) {
   const select = document.createElement("select");
   select.name = "game-kind";
@@ -633,7 +715,7 @@ function gameKindSelect(value) {
 }
 
 function runnerForGameKind(value) {
-  if (value === "steam") return "steam-proton";
+  if (value === "steam") return "steam";
   if (value.startsWith("open-ra")) return "openra";
   if (value === "dos") return "dosbox-x";
   if (value === "cncnet") return "cncnet";

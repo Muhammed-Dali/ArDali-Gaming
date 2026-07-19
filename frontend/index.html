@@ -7,14 +7,6 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <header class="window-titlebar" data-window-drag>
-      <div class="window-title" data-window-drag>ArDali Gaming</div>
-      <div class="window-controls">
-        <button type="button" data-window-action="minimize" aria-label="Kucult">_</button>
-        <button type="button" data-window-action="maximize" aria-label="Buyut">□</button>
-        <button type="button" data-window-action="close" aria-label="Kapat">×</button>
-      </div>
-    </header>
     <main class="app-shell">
       <aside class="sidebar" aria-label="Ana menü">
         <div class="brand">
@@ -45,6 +37,13 @@
         <div class="backend-banner" id="backend-banner" hidden>
           Wine kurulumu için uygulamayı Tauri penceresinde çalıştır: cd src-tauri && cargo tauri dev
         </div>
+        <div id="operation-overlay" class="operation-overlay" hidden aria-live="assertive" aria-busy="true">
+          <div class="operation-card">
+            <span class="operation-spinner" aria-hidden="true"></span>
+            <strong id="operation-title">Lütfen bekleyin</strong>
+            <span id="operation-message">İşlem hazırlanıyor</span>
+          </div>
+        </div>
 
         <div class="progress-panel" id="download-progress" hidden>
           <div class="progress-header">
@@ -71,6 +70,7 @@
                 <button data-library-filter="game" type="button">Oyunlar</button>
                 <button data-library-filter="windows-app" type="button">Windows</button>
                 <button data-library-filter="tool" type="button">Araç</button>
+                <button data-library-filter="installed" type="button">Kurulu Uygulamalar</button>
                 <button data-library-filter="installer" type="button">Kurulum</button>
               </div>
             </div>
@@ -151,20 +151,20 @@
         <section class="runtime-panel install-panel page-section" data-page="library" id="install-panel" aria-labelledby="install-title">
           <div class="panel-header">
             <div>
-              <h2 id="install-title">Kütüphaneye Ekle</h2>
-              <p>Windows EXE/MSI oyun veya araç dosyasını seç gerekiyorsa Wine ile kur sonra kütüphaneye ekle</p>
+              <h2 id="install-title">Windows Oyunu veya Uygulaması Ekle</h2>
+              <p>EXE veya MSI dosyasını seç ArDali Gaming kurulum gerekip gerekmediğini otomatik belirlesin</p>
             </div>
           </div>
 
           <form id="install-form" class="install-form">
             <input name="name" placeholder="Ad" autocomplete="off" required />
-            <select name="library-type" required>
+            <select name="library-type" required hidden>
               <option value="game">Oyun</option>
               <option value="windows-app">Windows Uygulaması</option>
               <option value="tool">Araç</option>
               <option value="installer">Kurulum Dosyası</option>
             </select>
-            <select name="game-kind" required>
+            <select name="game-kind" required hidden>
               <option value="windows-exe">Windows EXE</option>
               <option value="windows-msi">Windows MSI</option>
               <option value="open-ra-red-alert">OpenRA Red Alert</option>
@@ -174,24 +174,24 @@
               <option value="dos">DOS</option>
               <option value="steam">Steam</option>
             </select>
-            <select name="preferred-runner" required>
+            <select name="preferred-runner" required hidden>
               <option value="auto">Otomatik Runner</option>
               <option value="wine">Wine</option>
               <option value="proton">Proton</option>
             </select>
-            <select name="prefix-mode" required>
+            <select name="prefix-mode" required hidden>
               <option value="isolated">Ayrı Windows Ortamı</option>
               <option value="shared-windows-apps">Ortak Windows Uygulamaları Ortamı</option>
             </select>
             <input name="installer-path" placeholder="Windows dosyası .exe veya .msi" autocomplete="off" required />
             <div id="windows-file-preview" class="windows-file-preview" hidden></div>
-            <input name="install-dir" placeholder="Kurulum dizini boşsa otomatik" autocomplete="off" />
+            <input name="install-dir" placeholder="Kurulum dizini boşsa otomatik" autocomplete="off" hidden />
             <p id="windows-file-mode" class="install-mode-message" aria-live="polite"></p>
             <div class="install-actions">
-              <button id="pick-installer" type="button">Windows Dosyası Seç</button>
-              <button id="pick-install-dir" type="button">Klasör Seç</button>
-              <button id="run-installer" type="button">Installer Çalıştır</button>
-              <button type="submit">Kütüphaneye Ekle</button>
+              <button id="pick-installer" type="button">Başka Dosya Seç</button>
+              <button id="pick-install-dir" type="button" hidden>Klasör Seç</button>
+              <button id="run-installer" type="button" hidden>Kur</button>
+              <button type="submit">Otomatik Ekle / Kur</button>
             </div>
           </form>
         </section>
@@ -225,7 +225,35 @@
               <dt>Oyun</dt>
               <dd id="steam-games">Bekleniyor</dd>
             </div>
+            <div>
+              <dt>Steam istemcisi</dt>
+              <dd id="steam-launcher-status">Bekleniyor</dd>
+            </div>
+            <div>
+              <dt>GameMode</dt>
+              <dd id="steam-gamemode-status">Bekleniyor</dd>
+            </div>
+            <div>
+              <dt>Gamescope</dt>
+              <dd id="steam-gamescope-status">Bekleniyor</dd>
+            </div>
           </dl>
+
+          <div class="steam-library-toolbar" role="search">
+            <input id="steam-game-search" type="search" placeholder="Steam oyunlarında ara" autocomplete="off" />
+            <select id="steam-game-filter" aria-label="Steam oyun filtresi">
+              <option value="installed">Kurulu oyunlar</option>
+              <option value="synced">ArDali’ye eklenenler</option>
+              <option value="all">Tüm manifestler</option>
+            </select>
+            <span id="steam-library-summary">Henüz taranmadı</span>
+          </div>
+          <p id="steam-tool-guidance" class="steam-tool-guidance" hidden></p>
+          <div class="steam-diagnostics">
+            <button id="steam-gamemode-test" type="button">GameMode Testi</button>
+            <span id="steam-gamemode-test-result">Test edilmedi</span>
+          </div>
+          <div id="steam-game-list" class="game-grid steam-game-grid" aria-live="polite"></div>
         </section>
 
         <section class="runtime-panel page-section" data-page="compatibility" aria-labelledby="compat-title" hidden>
@@ -294,6 +322,10 @@
               <option value="false">FPS kapalı</option>
               <option value="true">FPS açık</option>
             </select>
+            <select name="auto-sync-steam">
+              <option value="false">Steam otomatik eşitleme kapalı</option>
+              <option value="true">Steam açılışta otomatik eşitlensin</option>
+            </select>
             <button type="submit">Kaydet</button>
           </form>
         </section>
@@ -344,7 +376,13 @@
             <select id="metadata-game" name="metadata-game" required>
               <option value="">Oyun seç</option>
             </select>
-            <input name="steamgriddb-key" placeholder="SteamGridDB API anahtarı" autocomplete="off" />
+            <input
+              name="steamgriddb-key"
+              type="password"
+              placeholder="SteamGridDB API anahtarı"
+              autocomplete="new-password"
+              spellcheck="false"
+            />
             <input name="cover-path" placeholder="Kapak dosyası .jpg veya .png" autocomplete="off" />
             <button type="submit">Manuel Kapak</button>
           </form>

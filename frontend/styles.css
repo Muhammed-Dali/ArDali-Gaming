@@ -207,12 +207,10 @@ option {
 .app-shell {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
-  height: calc(100vh - var(--titlebar-height));
+  height: 100vh;
   min-height: 0;
   overflow: auto;
-  background:
-    linear-gradient(135deg, rgba(25, 125, 108, 0.18), transparent 34%),
-    #111315;
+  background: #111315;
 }
 
 .sidebar {
@@ -398,7 +396,7 @@ option {
 
 .library-type-filter {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 6px;
   min-width: 0;
   padding: 4px;
@@ -446,9 +444,66 @@ option {
   font-size: 0.9rem;
 }
 
-.app-shell.playing .sidebar,
-.app-shell.playing .runtime-panel {
-  opacity: 0.56;
+.play-status.waiting::after {
+  content: ".....";
+  display: inline-block;
+  margin-left: 6px;
+  color: #9be86a;
+  letter-spacing: 3px;
+  width: 0;
+  overflow: hidden;
+  vertical-align: bottom;
+  animation: play-status-dots 1.2s steps(5, end) infinite;
+}
+
+@keyframes play-status-dots {
+  from { width: 0; }
+  to { width: 45px; }
+}
+
+.operation-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  background: rgba(4, 8, 9, 0.58);
+  backdrop-filter: blur(2px);
+}
+
+.operation-overlay[hidden] {
+  display: none;
+}
+
+.operation-card {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  min-width: min(360px, calc(100vw - 40px));
+  padding: 24px;
+  border: 1px solid rgba(216, 180, 93, 0.38);
+  border-radius: 12px;
+  background: #151a1b;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  color: #f1f3f3;
+}
+
+.operation-card > span:last-child {
+  color: #aeb8ba;
+  text-align: center;
+}
+
+.operation-spinner {
+  width: 30px;
+  height: 30px;
+  border: 3px solid rgba(216, 180, 93, 0.22);
+  border-top-color: #d8b45d;
+  border-radius: 50%;
+  animation: operation-spin 0.8s linear infinite;
+}
+
+@keyframes operation-spin {
+  to { transform: rotate(360deg); }
 }
 
 .game-grid {
@@ -589,6 +644,20 @@ option {
   margin-top: 10px;
 }
 
+.game-card-activity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin-top: 9px;
+  color: #9fabb0;
+  font-size: 0.76rem;
+}
+
+.game-card-activity span:first-child {
+  color: #cbd5d9;
+  font-weight: 700;
+}
+
 .library-badge {
   display: inline-flex;
   align-items: center;
@@ -611,6 +680,21 @@ option {
 .library-badge-runner {
   background: rgba(31, 127, 114, 0.2);
   color: #cde9e4;
+}
+
+.library-badge-synced {
+  background: rgba(82, 137, 205, 0.22);
+  color: #cfe4ff;
+}
+
+.library-badge-gamemode {
+  background: rgba(92, 190, 106, 0.2);
+  color: #ccf4d2;
+}
+
+.library-badge-unavailable {
+  background: rgba(180, 72, 72, 0.22);
+  color: #ffd0d0;
 }
 
 .game-actions {
@@ -790,6 +874,90 @@ option {
   margin: 8px 0 0;
   color: #eef4f6;
   font-size: 0.92rem;
+}
+
+[data-page="steam"] .runtime-grid {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.steam-library-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, auto) auto;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 0 12px;
+}
+
+.steam-library-toolbar input,
+.steam-library-toolbar select {
+  min-height: 42px;
+}
+
+.steam-library-toolbar span {
+  color: #aeb8bd;
+  font-size: 0.84rem;
+  font-weight: 700;
+  text-align: right;
+}
+
+.steam-tool-guidance {
+  margin: 0 0 12px;
+  padding: 11px 13px;
+  border: 1px solid rgba(216, 180, 93, 0.3);
+  border-radius: 8px;
+  background: rgba(216, 180, 93, 0.09);
+  color: #efdca8;
+}
+
+.steam-diagnostics {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 14px;
+  color: #aeb8bd;
+  font-size: 0.84rem;
+}
+
+.steam-diagnostics .is-ready { color: #9ee5aa; }
+.steam-diagnostics .is-error { color: #ffb4b4; }
+
+.steam-game-grid {
+  padding-bottom: 10px;
+}
+
+.steam-game-card {
+  grid-template-rows: 170px 1fr auto;
+  min-height: 310px;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+
+.steam-game-card:hover,
+.steam-game-card:focus-visible,
+.steam-game-card:focus-within {
+  border-color: rgba(216, 180, 93, 0.72);
+  box-shadow: 0 0 0 3px rgba(216, 180, 93, 0.14), 0 16px 32px rgba(0, 0, 0, 0.28);
+  outline: none;
+  transform: translateY(-2px);
+}
+
+.steam-cover {
+  background:
+    radial-gradient(circle at 75% 18%, rgba(70, 133, 190, 0.35), transparent 35%),
+    linear-gradient(145deg, #182838, #162027 58%, #25383c);
+}
+
+.steam-card-path {
+  overflow: hidden;
+  margin: 9px 0 0;
+  color: #98a7ad;
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.steam-card-actions button:focus-visible {
+  outline: 3px solid rgba(238, 210, 140, 0.85);
+  outline-offset: 2px;
 }
 
 .progress-panel {
@@ -1539,8 +1707,13 @@ option {
   .library-tools,
   .library-controls,
   .library-type-filter,
-  .game-settings-grid {
+  .game-settings-grid,
+  .steam-library-toolbar {
     grid-template-columns: 1fr;
+  }
+
+  .steam-library-toolbar span {
+    text-align: left;
   }
 
   .library-tools {

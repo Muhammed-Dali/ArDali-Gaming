@@ -1,6 +1,6 @@
 {
   "name": "ardali-gaming",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "scripts": {
     "tauri:dev": "cd src-tauri && cargo tauri dev",
