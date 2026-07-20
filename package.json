@@ -1,9 +1,10 @@
 {
   "name": "ardali-gaming",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "scripts": {
-    "tauri:dev": "cd src-tauri && cargo tauri dev",
+    "desktop:install": "packaging/install-desktop-integration.sh",
+    "tauri:dev": "packaging/install-desktop-integration.sh && cd src-tauri && cargo tauri dev",
     "tauri:build": "cd src-tauri && cargo tauri build",
     "check": "cd src-tauri && cargo check"
   }

@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "ardali-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "ardali-gaming"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ardali-core",
  "ardali-storage",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "ardali-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ardali-core",
  "rusqlite",

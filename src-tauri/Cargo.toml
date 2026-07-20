@@ -1,6 +1,6 @@
 [package]
 name = "ardali-gaming"
-version = "0.2.0"
+version = "0.2.1"
 description = "Linux game launcher with portable Wine, Proton, and emulator management"
 authors = ["ArDali Gaming"]
 license = ""
