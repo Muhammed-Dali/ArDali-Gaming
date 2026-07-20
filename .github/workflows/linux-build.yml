@@ -1,0 +1,106 @@
+name: ArDali Linux Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ardali-linux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Test and verify
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> src-tauri/target"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      - name: Verify release tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          app_version="$(node -p "require('./package.json').version")"
+          test "v${app_version}" = "${GITHUB_REF_NAME}"
+
+      - name: Run project verification
+        run: packaging/verify-release.sh
+
+  package:
+    name: Build Linux packages
+    needs: verify
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            rpm \
+            xdg-utils
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> src-tauri/target"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      - name: Build packages and publish tagged releases
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: src-tauri
+          args: >-
+            --bundles appimage,deb,rpm
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: "ardali-gaming-[version]-linux-[arch]-[bundle]"
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('ArDali Gaming {0}', github.ref_name) || '' }}
+          releaseBody: "Linux paketlerini aşağıdaki Assets bölümünden indirebilirsiniz."
+          generateReleaseNotes: true
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
