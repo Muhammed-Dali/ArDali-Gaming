@@ -26,6 +26,16 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v7
 
+      - name: Install Linux test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
